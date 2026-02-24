@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  jira-telegram-bot:
+    build: .
+    container_name: jira-telegram-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - JIRA_BASE_URL=${JIRA_BASE_URL}
+      - DEFAULT_CHECK_INTERVAL=${DEFAULT_CHECK_INTERVAL}
+      - ADMIN_USER_IDS=${ADMIN_USER_IDS}
+      - DATABASE_PATH=/app/data/jira_bot.db
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      # Монтируем папку data из хоста в контейнер
+      - ./data:/app/data
+      # Можно добавить папку для бекапов (опционально)
+      - ./data/backups:/app/data/backups
+    networks:
+      - jira-bot-network
+
+networks:
+  jira-bot-network:
+    driver: bridge

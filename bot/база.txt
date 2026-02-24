@@ -1,0 +1,706 @@
+# db.py
+import sqlite3
+import logging
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List, Dict, Any
+import uuid
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = Path("data/state.db")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+class Database:
+    def __init__(self):
+        self.conn = None
+        self._init_db()
+    
+    def _get_conn(self):
+        """Получить соединение с базой данных"""
+        if self.conn is None:
+            self.conn = sqlite3.connect(DB_PATH)
+            self.conn.row_factory = sqlite3.Row
+        return self.conn
+    
+    def _init_db(self):
+        """Инициализировать базу данных"""
+        try:
+            conn = self._get_conn()
+            
+            # Таблица пользователей
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                jira_user TEXT,
+                jira_token TEXT,
+                chat_id INTEGER,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """)
+            
+            # Таблица фильтров пользователей
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filter_name TEXT,
+                jql TEXT,
+                is_active INTEGER DEFAULT 1,
+                check_interval INTEGER DEFAULT 5,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                UNIQUE(user_id, filter_name)
+            )
+            """)
+            
+            # Таблица для отслеживания задач (теперь с user_id)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracked_issues (
+                user_id INTEGER,
+                filter_name TEXT,
+                issue_id TEXT,
+                issue_key TEXT,
+                last_updated TEXT,
+                state_hash TEXT,
+                last_notification_hash TEXT,
+                first_seen TEXT,
+                last_checked TEXT,
+                notification_count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, filter_name, issue_id),
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """)
+            
+            # Таблица истории уведомлений (теперь с user_id)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS notification_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filter_name TEXT,
+                issue_key TEXT,
+                notification_hash TEXT,
+                notification_type TEXT,
+                sent_at TEXT,
+                details TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """)
+            
+            # Таблица сессий пользователей (для хранения временных данных)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                step TEXT,
+                data TEXT,
+                created_at TEXT,
+                expires_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+            """)
+            
+            # Индексы
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_chat ON users(chat_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_user ON tracked_issues(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON notification_history(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id)")
+            
+            conn.commit()
+            logger.info("✅ Database initialized with multi-user support")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize database: {e}")
+            raise
+    
+    # ---------- Методы для работы с пользователями ----------
+    
+    def get_or_create_user(self, user_id: int, username: str = None, 
+                          first_name: str = None, last_name: str = None,
+                          chat_id: int = None) -> Dict[str, Any]:
+        """Получить или создать пользователя"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            # Проверяем существующего пользователя
+            cur = conn.execute("""
+                SELECT * FROM users WHERE user_id = ?
+            """, (user_id,))
+            
+            user = cur.fetchone()
+            
+            if user:
+                # Обновляем информацию о пользователе
+                conn.execute("""
+                    UPDATE users 
+                    SET username = ?, first_name = ?, last_name = ?, 
+                        chat_id = ?, updated_at = ?
+                    WHERE user_id = ?
+                """, (username, first_name, last_name, chat_id, now, user_id))
+                conn.commit()
+                
+                logger.info(f"📝 Updated user: {user_id}")
+                return dict(user)
+            else:
+                # Создаем нового пользователя
+                conn.execute("""
+                    INSERT INTO users 
+                    (user_id, username, first_name, last_name, chat_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, username, first_name, last_name, chat_id, now, now))
+                conn.commit()
+                
+                logger.info(f"👤 New user created: {user_id} ({username})")
+                
+                # Получаем созданного пользователя
+                cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+                return dict(cur.fetchone())
+                
+        except Exception as e:
+            logger.error(f"❌ Error getting/creating user: {e}")
+            return {}
+    
+    def update_user_jira_credentials(self, user_id: int, jira_user: str, jira_token: str) -> bool:
+        """Обновить Jira credentials пользователя"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            conn.execute("""
+                UPDATE users 
+                SET jira_user = ?, jira_token = ?, updated_at = ?
+                WHERE user_id = ?
+            """, (jira_user, jira_token, now, user_id))
+            
+            conn.commit()
+            logger.info(f"🔑 Updated Jira credentials for user: {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating Jira credentials: {e}")
+            return False
+    
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получить пользователя по ID"""
+        try:
+            conn = self._get_conn()
+            cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Error getting user: {e}")
+            return None
+    
+    def get_user_by_chat_id(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        """Получить пользователя по chat_id"""
+        try:
+            conn = self._get_conn()
+            cur = conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Error getting user by chat_id: {e}")
+            return None
+    
+    def get_all_active_users(self) -> List[Dict[str, Any]]:
+        """Получить всех активных пользователей"""
+        try:
+            conn = self._get_conn()
+            cur = conn.execute("""
+                SELECT * FROM users 
+                WHERE is_active = 1 AND jira_user IS NOT NULL AND jira_token IS NOT NULL
+                ORDER BY user_id
+            """)
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"❌ Error getting active users: {e}")
+            return []
+    
+    # ---------- Методы для работы с фильтрами ----------
+    
+    def add_user_filter(self, user_id: int, filter_name: str, jql: str, 
+                       check_interval: int = 5) -> bool:
+        """Добавить фильтр для пользователя"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            conn.execute("""
+                INSERT OR REPLACE INTO user_filters 
+                (user_id, filter_name, jql, check_interval, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, filter_name, jql, check_interval, now, now))
+            
+            conn.commit()
+            logger.info(f"📋 Added filter '{filter_name}' for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error adding user filter: {e}")
+            return False
+    
+    def get_user_filters(self, user_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
+        """Получить фильтры пользователя"""
+        try:
+            conn = self._get_conn()
+            
+            if active_only:
+                cur = conn.execute("""
+                    SELECT * FROM user_filters 
+                    WHERE user_id = ? AND is_active = 1
+                    ORDER BY filter_name
+                """, (user_id,))
+            else:
+                cur = conn.execute("""
+                    SELECT * FROM user_filters 
+                    WHERE user_id = ?
+                    ORDER BY filter_name
+                """, (user_id,))
+            
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"❌ Error getting user filters: {e}")
+            return []
+    
+    def delete_user_filter(self, user_id: int, filter_name: str) -> bool:
+        """Удалить фильтр пользователя"""
+        try:
+            conn = self._get_conn()
+            
+            conn.execute("""
+                DELETE FROM user_filters 
+                WHERE user_id = ? AND filter_name = ?
+            """, (user_id, filter_name))
+            
+            # Также удаляем отслеживаемые задачи для этого фильтра
+            conn.execute("""
+                DELETE FROM tracked_issues 
+                WHERE user_id = ? AND filter_name = ?
+            """, (user_id, filter_name))
+            
+            conn.commit()
+            logger.info(f"🗑️ Deleted filter '{filter_name}' for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error deleting user filter: {e}")
+            return False
+    
+    def update_filter_interval(self, user_id: int, filter_name: str, 
+                              interval: int) -> bool:
+        """Обновить интервал проверки фильтра"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            conn.execute("""
+                UPDATE user_filters 
+                SET check_interval = ?, updated_at = ?
+                WHERE user_id = ? AND filter_name = ?
+            """, (interval, now, user_id, filter_name))
+            
+            conn.commit()
+            logger.info(f"⏱️ Updated interval for filter '{filter_name}' to {interval} min")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating filter interval: {e}")
+            return False
+    
+    def toggle_filter_active(self, user_id: int, filter_name: str, 
+                            is_active: bool) -> bool:
+        """Включить/выключить фильтр"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            conn.execute("""
+                UPDATE user_filters 
+                SET is_active = ?, updated_at = ?
+                WHERE user_id = ? AND filter_name = ?
+            """, (1 if is_active else 0, now, user_id, filter_name))
+            
+            conn.commit()
+            logger.info(f"🔌 {'Enabled' if is_active else 'Disabled'} filter '{filter_name}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error toggling filter: {e}")
+            return False
+    
+    # ---------- Методы для работы с сессиями ----------
+    
+    def create_session(self, user_id: int, step: str, data: Dict[str, Any] = None, 
+                      ttl_minutes: int = 30) -> str:
+        """Создать сессию пользователя"""
+        try:
+            session_id = str(uuid.uuid4())
+            conn = self._get_conn()
+            now = datetime.now()
+            expires_at = (now + timedelta(minutes=ttl_minutes)).isoformat()
+            
+            conn.execute("""
+                INSERT INTO user_sessions 
+                (session_id, user_id, step, data, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (session_id, user_id, step, 
+                  json.dumps(data) if data else None, 
+                  now.isoformat(), expires_at))
+            
+            conn.commit()
+            logger.debug(f"Created session {session_id} for user {user_id}")
+            return session_id
+            
+        except Exception as e:
+            logger.error(f"❌ Error creating session: {e}")
+            return ""
+    
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Получить сессию"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            # Удаляем просроченные сессии
+            conn.execute("DELETE FROM user_sessions WHERE expires_at < ?", (now,))
+            
+            cur = conn.execute("""
+                SELECT * FROM user_sessions 
+                WHERE session_id = ?
+            """, (session_id,))
+            
+            row = cur.fetchone()
+            if row:
+                session_data = dict(row)
+                session_data["data"] = json.loads(row["data"]) if row["data"] else {}
+                return session_data
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting session: {e}")
+            return None
+    
+    def update_session(self, session_id: str, step: str = None, 
+                      data: Dict[str, Any] = None) -> bool:
+        """Обновить сессию"""
+        try:
+            conn = self._get_conn()
+            
+            updates = []
+            params = []
+            
+            if step:
+                updates.append("step = ?")
+                params.append(step)
+            
+            if data is not None:
+                updates.append("data = ?")
+                params.append(json.dumps(data))
+            
+            if not updates:
+                return True
+            
+            params.append(session_id)
+            
+            query = f"UPDATE user_sessions SET {', '.join(updates)} WHERE session_id = ?"
+            conn.execute(query, params)
+            conn.commit()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating session: {e}")
+            return False
+    
+    def delete_session(self, session_id: str) -> bool:
+        """Удалить сессию"""
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM user_sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error deleting session: {e}")
+            return False
+    
+    # ---------- Методы для работы с задачами (обновленные с user_id) ----------
+    
+    def _calculate_state_hash(self, issue: Dict[str, Any]) -> str:
+        """Вычислить хеш состояния задачи"""
+        try:
+            fields = issue.get("fields", {})
+            
+            state_data = {
+                "updated": fields.get("updated"),
+                "status": fields.get("status", {}).get("name"),
+                "assignee": fields.get("assignee", {}).get("displayName") if fields.get("assignee") else None,
+                "summary": fields.get("summary"),
+                "priority": fields.get("priority", {}).get("name"),
+                "resolution": fields.get("resolution", {}).get("name") if fields.get("resolution") else None,
+                "labels": sorted(fields.get("labels", [])),
+                "components": sorted([c.get("name") for c in fields.get("components", []) if c.get("name")])
+            }
+            
+            comments = fields.get("comment", {}).get("comments", [])
+            if comments:
+                state_data["comment_count"] = len(comments)
+                last_comment = comments[-1]
+                state_data["last_comment_id"] = last_comment.get("id")
+                state_data["last_comment_author"] = last_comment.get("author", {}).get("displayName")
+                state_data["last_comment_created"] = last_comment.get("created")
+            else:
+                state_data["comment_count"] = 0
+                state_data["last_comment_id"] = None
+            
+            state_json = json.dumps(state_data, sort_keys=True, ensure_ascii=False)
+            return hashlib.md5(state_json.encode('utf-8')).hexdigest()
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating state hash: {e}")
+            return ""
+    
+    def _calculate_notification_hash(self, issue: Dict[str, Any], change_type: str) -> str:
+        """Вычислить хеш уведомления"""
+        try:
+            key = issue.get("key", "")
+            fields = issue.get("fields", {})
+            
+            notification_data = {
+                "issue_key": key,
+                "change_type": change_type,
+                "summary": fields.get("summary"),
+                "status": fields.get("status", {}).get("name"),
+                "assignee": fields.get("assignee", {}).get("displayName") if fields.get("assignee") else None,
+                "updated": fields.get("updated"),
+                "priority": fields.get("priority", {}).get("name")
+            }
+            
+            comments = fields.get("comment", {}).get("comments", [])
+            if comments:
+                last_comment = comments[-1]
+                notification_data["last_comment_id"] = last_comment.get("id")
+                notification_data["last_comment_created"] = last_comment.get("created")
+            else:
+                notification_data["last_comment_id"] = None
+            
+            notification_json = json.dumps(notification_data, sort_keys=True, ensure_ascii=False)
+            return hashlib.md5(notification_json.encode('utf-8')).hexdigest()
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating notification hash: {e}")
+            return ""
+    
+    def check_and_update_issue(self, user_id: int, filter_name: str, 
+                              issue: Dict[str, Any]) -> Dict[str, Any]:
+        """Проверить, изменилась ли задача, и обновить информацию"""
+        try:
+            issue_id = issue.get("id")
+            issue_key = issue.get("key")
+            updated = issue.get("fields", {}).get("updated")
+            
+            if not all([issue_id, issue_key, updated]):
+                logger.error(f"❌ Incomplete issue data for {issue_key}")
+                return {"has_changes": False, "change_type": None}
+            
+            now = datetime.now().isoformat()
+            state_hash = self._calculate_state_hash(issue)
+            
+            if not state_hash:
+                return {"has_changes": False, "change_type": None}
+            
+            conn = self._get_conn()
+            
+            # Проверяем, есть ли задача уже в отслеживании
+            cur = conn.execute("""
+                SELECT state_hash, first_seen, notification_count 
+                FROM tracked_issues 
+                WHERE user_id=? AND filter_name=? AND issue_id=?
+            """, (user_id, filter_name, issue_id))
+            
+            existing = cur.fetchone()
+            
+            if not existing:
+                # Новая задача для фильтра
+                conn.execute("""
+                    INSERT INTO tracked_issues 
+                    (user_id, filter_name, issue_id, issue_key, last_updated, state_hash, 
+                     first_seen, last_checked, notification_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, filter_name, issue_id, issue_key, updated, state_hash, 
+                      now, now, 0))
+                conn.commit()
+                
+                logger.info(f"📝 New task registered for user {user_id}: {issue_key}")
+                return {
+                    "has_changes": True,
+                    "change_type": "new",
+                    "issue_key": issue_key,
+                    "state_hash": state_hash,
+                    "is_new": True
+                }
+            
+            # Задача уже отслеживается
+            existing_state_hash = existing["state_hash"]
+            
+            if existing_state_hash != state_hash:
+                # Состояние изменилось
+                conn.execute("""
+                    UPDATE tracked_issues 
+                    SET last_updated=?, state_hash=?, last_checked=?
+                    WHERE user_id=? AND filter_name=? AND issue_id=?
+                """, (updated, state_hash, now, user_id, filter_name, issue_id))
+                conn.commit()
+                
+                logger.info(f"🔄 Task state changed for user {user_id}: {issue_key}")
+                return {
+                    "has_changes": True,
+                    "change_type": "updated",
+                    "issue_key": issue_key,
+                    "state_hash": state_hash,
+                    "previous_state_hash": existing_state_hash,
+                    "is_new": False
+                }
+            else:
+                # Состояние не изменилось
+                conn.execute("""
+                    UPDATE tracked_issues 
+                    SET last_checked=?
+                    WHERE user_id=? AND filter_name=? AND issue_id=?
+                """, (now, user_id, filter_name, issue_id))
+                conn.commit()
+                
+                logger.debug(f"📊 No changes for {issue_key} (user {user_id})")
+                return {
+                    "has_changes": False,
+                    "change_type": None,
+                    "issue_key": issue_key,
+                    "state_hash": state_hash,
+                    "is_new": False
+                }
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking issue: {e}")
+            return {"has_changes": False, "change_type": None}
+    
+    def was_notification_sent(self, user_id: int, filter_name: str, 
+                            issue_key: str, notification_hash: str) -> bool:
+        """Проверить, отправлялось ли уже такое уведомление"""
+        try:
+            conn = self._get_conn()
+            
+            cur = conn.execute("""
+                SELECT 1 FROM notification_history 
+                WHERE user_id=? AND filter_name=? AND issue_key=? AND notification_hash=?
+                LIMIT 1
+            """, (user_id, filter_name, issue_key, notification_hash))
+            
+            return cur.fetchone() is not None
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking notification history: {e}")
+            return False
+    
+    def record_notification(self, user_id: int, filter_name: str, issue_key: str, 
+                          notification_hash: str, change_type: str, 
+                          details: Dict[str, Any] = None):
+        """Записать отправку уведомления в историю"""
+        try:
+            conn = self._get_conn()
+            now = datetime.now().isoformat()
+            
+            # Записываем в историю
+            conn.execute("""
+                INSERT INTO notification_history 
+                (user_id, filter_name, issue_key, notification_hash, notification_type, sent_at, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, filter_name, issue_key, notification_hash, change_type, now,
+                  json.dumps(details) if details else None))
+            
+            # Увеличиваем счетчик уведомлений для задачи
+            conn.execute("""
+                UPDATE tracked_issues 
+                SET notification_count = notification_count + 1,
+                    last_notification_hash = ?
+                WHERE user_id=? AND filter_name=? AND issue_key=?
+            """, (notification_hash, user_id, filter_name, issue_key))
+            
+            conn.commit()
+            logger.debug(f"📝 Notification recorded for user {user_id}: {issue_key}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error recording notification: {e}")
+    
+    def get_user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Получить статистику по пользователю"""
+        try:
+            conn = self._get_conn()
+            stats = {}
+            
+            # Статистика по фильтрам
+            cur = conn.execute("""
+                SELECT 
+                    COUNT(*) as total_filters,
+                    SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_filters
+                FROM user_filters 
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            if row:
+                stats["total_filters"] = row["total_filters"] or 0
+                stats["active_filters"] = row["active_filters"] or 0
+            
+            # Статистика по задачам
+            cur = conn.execute("""
+                SELECT 
+                    COUNT(*) as total_tracked,
+                    SUM(notification_count) as total_notifications
+                FROM tracked_issues 
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            if row:
+                stats["total_tracked"] = row["total_tracked"] or 0
+                stats["total_notifications"] = row["total_notifications"] or 0
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting user stats: {e}")
+            return {}
+    
+    def cleanup_old_data(self, days: int = 30):
+        """Очистить старые данные"""
+        try:
+            conn = self._get_conn()
+            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+            
+            # Удаляем старые сессии
+            conn.execute("DELETE FROM user_sessions WHERE expires_at < ?", (cutoff_date,))
+            
+            conn.commit()
+            logger.info(f"🧹 Cleaned up old data (older than {days} days)")
+            
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up old data: {e}")
+    
+    def close(self):
+        """Закрыть соединение с базой данных"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+# Глобальный экземпляр базы данных
+db = Database()

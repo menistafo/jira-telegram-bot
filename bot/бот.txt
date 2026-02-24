@@ -1,0 +1,2326 @@
+# bot.py
+import asyncio
+import logging
+import html
+import inspect
+import os
+from typing import Dict, Any, Optional, List
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResultArticle, InputTextMessageContent,
+    ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+)
+from telegram.constants import ParseMode
+import telegram.error
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, 
+    ConversationHandler, MessageHandler, filters,
+    CallbackQueryHandler, InlineQueryHandler
+)
+
+from .config import BOT_TOKEN, DEFAULT_CHECK_INTERVAL, ADMIN_USER_IDS, REMINDER_INTERVAL_MINUTES, MENTIONS_ENABLED, MENTIONS_CHECK_INTERVAL
+from .db import db
+from .jira_manager import jira_manager
+from .watcher import smart_watcher
+from .mentions import mentions_tracker
+from .utils import get_msk_time, format_time_until_morning, should_send_reminder_check
+
+# Подключаем фичи
+from .digest import generate_user_digest, daily_digest_scheduler
+
+logger = logging.getLogger(__name__)
+
+# Безопасное получение URL для WebApp
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://google.com")
+
+# Состояния для ConversationHandler
+SETUP_JIRA_USER, SETUP_JIRA_TOKEN, ADD_FILTER_NAME, ADD_FILTER_JQL = range(4)
+
+# Глобальные переменные
+bot_app = None
+watcher_task = None
+digest_task = None
+user_muted = {}  # user_id -> muted status
+
+# ------------------- Вспомогательные функции -------------------
+def clean_text(text: str) -> str:
+    """
+    Безопасное экранирование текста для HTML.
+    Избавляет от любых ошибок парсинга спецсимволов.
+    """
+    if not text:
+        return ""
+    return html.escape(str(text))
+
+async def get_user_data(update: Update) -> Dict[str, Any]:
+    """Получить данные пользователя из базы"""
+    user = update.effective_user
+    chat = update.effective_chat
+    
+    user_data = db.get_or_create_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        chat_id=chat.id if chat else None
+    )
+    
+    return user_data
+
+async def send_message_safe(user_id: int, text: str, parse_mode: str = ParseMode.HTML, 
+                           reply_markup = None, message_id: Optional[int] = None) -> Optional[int]:
+    """
+    Безопасная отправка сообщения с обработкой ошибок
+    Возвращает ID отправленного сообщения или None
+    """
+    if not bot_app:
+        logger.error("❌ Bot app not initialized")
+        return None
+    
+    try:
+        user = db.get_user(user_id)
+        if not user or not user.get("chat_id"):
+            logger.warning(f"User {user_id} not found or no chat_id")
+            return None
+        
+        chat_id = user["chat_id"]
+        safe_text = text
+        
+        # Проверяем длину текста (ограничение Telegram)
+        if len(safe_text) > 4096:
+            logger.warning(f"Text too long ({len(safe_text)} chars), truncating...")
+            safe_text = safe_text[:4000] + "\n\n...[текст сокращен]"
+        
+        # logger.debug(f"Sending message to user {user_id}, chat {chat_id}")
+        
+        if message_id:
+            # Редактируем существующее сообщение
+            try:
+                message = await bot_app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=safe_text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                # logger.debug(f"Message {message_id} edited successfully for user {user_id}")
+                return message_id
+            except telegram.error.BadRequest as e:
+                # [FIX] Игнорируем ошибку, если сообщение не изменилось
+                if "Message is not modified" in str(e):
+                    logger.debug(f"Message {message_id} not modified, skipping edit.")
+                    return message_id
+                logger.error(f"Failed to edit message {message_id} for user {user_id}: {e}")
+                # Если редактирование не удалось по другой причине, пробуем отправить новое
+                message_id = None
+            except Exception as edit_error:
+                logger.error(f"Failed to edit message {message_id} for user {user_id}: {edit_error}")
+                message_id = None
+        
+        if not message_id:
+            # Отправляем новое сообщение
+            try:
+                message = await bot_app.bot.send_message(
+                    chat_id=chat_id,
+                    text=safe_text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                
+                # logger.debug(f"Message sent successfully to user {user_id}, message_id: {message.message_id}")
+                return message.message_id
+            except Exception as send_error:
+                logger.error(f"Failed to send message to user {user_id}: {send_error}")
+                return None
+        
+    except Exception as e:
+        logger.error(f"❌ Critical error sending message to user {user_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+# ------------------- Общие функции -------------------
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена любого диалога"""
+    session_id = context.user_data.get("session_id")
+    if session_id:
+        db.delete_session(session_id)
+        if "session_id" in context.user_data:
+            del context.user_data["session_id"]
+    
+    await update.message.reply_text("❌ Операция отменена.")
+    return ConversationHandler.END
+
+# ------------------- Обработка реакций -------------------
+async def handle_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка реакций на уведомления"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user_id = query.from_user.id
+    
+    if data.startswith("ack_"):
+        # Пользователь подтвердил получение уведомления
+        parts = data.split("_")
+        if len(parts) >= 3:
+            issue_key = parts[1]
+            notification_hash = parts[2]
+            
+            # Сохраняем реакцию пользователя
+            db.record_user_reaction(user_id, issue_key, notification_hash)
+            
+            # Отправляем подтверждение
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("✅ Вы подтвердили получение уведомления. Я больше не буду напоминать об этой задаче.")
+            
+            logger.info(f"User {user_id} acknowledged notification for {issue_key}")
+    
+    elif data.startswith("mute_"):
+        # Пользователь временно отключает уведомления для этой задачи
+        parts = data.split("_")
+        if len(parts) >= 3:
+            issue_key = parts[1]
+            filter_name_from_callback = parts[2]  # Фильтр из callback_data
+            
+            # НАХОДИМ РЕАЛЬНОЕ ИМЯ ФИЛЬТРА ИЗ СООБЩЕНИЯ
+            # Ищем реальный filter_name в тексте сообщения
+            message_text = query.message.text
+            filter_name = filter_name_from_callback  # По умолчанию используем из callback
+            
+            # Пытаемся найти реальное имя фильтра в тексте сообщения
+            import re
+            filter_match = re.search(r'Фильтр: (.+)', message_text)
+            if filter_match:
+                real_filter_name = filter_match.group(1).strip()
+                if real_filter_name != filter_name_from_callback:
+                    logger.info(f"🎯 Found real filter name in message: '{real_filter_name}' instead of callback '{filter_name_from_callback}'")
+                    filter_name = real_filter_name
+            
+            # Сохраняем временное отключение (на 24 часа) с РЕАЛЬНЫМ именем фильтра
+            success = db.mute_task_notifications(user_id, issue_key, filter_name, hours=24)
+            
+            if success:
+                # Также отмечаем все существующие уведомления по этой задаче как подтвержденные
+                query_update = """
+                UPDATE notifications 
+                SET user_reaction = 'muted_by_user'
+                WHERE user_id = ? AND issue_key = ? AND filter_name = ?
+                AND (user_reaction IS NULL OR user_reaction = '')
+                """
+                db.cursor.execute(query_update, (user_id, issue_key, filter_name))
+                db.conn.commit()
+                
+                # ДОПОЛНИТЕЛЬНО: удаляем все pending напоминания для этой задачи
+                query_delete_reminders = """
+                DELETE FROM notifications 
+                WHERE user_id = ? AND issue_key = ? AND filter_name = ?
+                AND is_reminder = 1
+                """
+                db.cursor.execute(query_delete_reminders, (user_id, issue_key, filter_name))
+                db.conn.commit()
+                
+                # УБЕДИТЕЛЬНАЯ ПРОВЕРКА: отмечаем ВСЕ уведомления как отключенные
+                query_all_notifications = """
+                SELECT filter_name FROM notifications 
+                WHERE user_id = ? AND issue_key = ? 
+                AND (user_reaction IS NULL OR user_reaction = '')
+                """
+                db.cursor.execute(query_all_notifications, (user_id, issue_key))
+                all_filters = [row[0] for row in db.cursor.fetchall()]
+                
+                if all_filters:
+                    logger.info(f"📋 All filters for issue {issue_key}: {all_filters}")
+                    # Отключаем для всех найденных фильтров
+                    for f_name in all_filters:
+                        if f_name != filter_name:
+                            logger.info(f"🔄 Also muting for filter: {f_name}")
+                            db.mute_task_notifications(user_id, issue_key, f_name, hours=24)
+                
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text(f"🔕 Уведомления для задачи {issue_key} отключены на 24 часа.")
+                
+                logger.info(f"User {user_id} muted notifications for {issue_key} (filter: {filter_name})")
+            else:
+                logger.error(f"❌ Failed to mute notifications for {issue_key}")
+    
+    elif data.startswith("mention_ack_"):
+        # Пользователь подтвердил упоминание
+        issue_key = data.replace("mention_ack_", "")
+        
+        # Помечаем ВСЕ упоминания по этой задаче как прочитанные
+        db.mark_mentions_as_notified(user_id, issue_key)
+        
+        # Удаляем кнопки
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"✅ Упоминания в задаче {issue_key} отмечены как прочитанные.")
+        
+        logger.info(f"User {user_id} acknowledged mentions for {issue_key}")
+    
+    elif data == "noop":
+        # Пустое действие (для заголовков кнопок)
+        await query.answer()
+
+# ------------------- Команды настройки -------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало работы с ботом"""
+    user_data = await get_user_data(update)
+    
+    welcome_text = f"""
+🤖 Добро пожаловать в Jira Monitor Bot, {update.effective_user.first_name}!
+
+Этот бот помогает отслеживать изменения в задачах Jira.
+
+Новые возможности:
+• 🚨 Отслеживание блокирующих задач - бот автоматически анализирует связи
+• 👤 Информация о назначенных на блокирующие задачи
+• 📊 Статистика блокировок в каждом уведомлении
+• 🔗 Прямые ссылки на связанные задачи
+• 🔔 Уведомления об упоминаниях (@username) в комментариях и описаниях
+• ☀️ Утренние дайджесты - получай статус задач каждое утро
+• 🔍 Инлайн-поиск - ищи задачи прямо в любом чате (через @твой_бот)
+
+Основные функции:
+• Уведомления при изменениях задач
+• Напоминания каждые {REMINDER_INTERVAL_MINUTES} минут, если не подтвердить уведомление
+• Ночной режим (22:00-09:00 МСК) - напоминания не отправляются
+
+Для начала работы:
+1. /setup - Настроить подключение к Jira
+2. /addfilter - Добавить фильтр для отслеживания
+3. /help - Показать все команды
+
+Если вы уже настроили бота, используйте:
+• /filters - Управление фильтрами
+• /digest - Запросить утреннюю сводку вручную
+• /status - Статус ваших отслеживаний
+• /mute - Вкл/выкл все уведомления
+    """
+    
+    # Создаем кнопку для Mini App, которая будет висеть под полем ввода
+    reply_markup = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Открыть Jira WebApp", web_app=WebAppInfo(url=WEBAPP_URL))]],
+        resize_keyboard=True
+    )
+    
+    try:
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error sending start message: {e}")
+        # Пробуем отправить упрощенное сообщение
+        fallback_text = f"Добро пожаловать в Jira Monitor Bot, {update.effective_user.first_name}! Используйте /help для списка команд."
+        await update.message.reply_text(fallback_text, reply_markup=reply_markup)
+
+async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало настройки Jira подключения"""
+    user_data = await get_user_data(update)
+    
+    # Проверяем, не настроен ли уже пользователь
+    if user_data.get("jira_user") and user_data.get("jira_token"):
+        await update.message.reply_text(
+            "🔧 Вы уже настроили подключение к Jira.\n\n"
+            "Если хотите изменить настройки, используйте:\n"
+            "/reconfigure - перенастроить Jira\n"
+            "/filters - управление фильтрами"
+        )
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "🔧 Настройка подключения к Jira\n\n"
+        "Для работы бота нужны:\n"
+        "1. Jira Username (ваш логин в Jira)\n"
+        "2. Jira API Token (можно получить в настройках Jira)\n\n"
+        "Шаг 1 из 2:\n"
+        "Отправьте мне ваш Jira Username (обычно это email или логин):"
+    )
+    
+    # Сохраняем сессию
+    session_id = db.create_session(
+        user_id=user_data["user_id"],
+        step="setup_jira_user"
+    )
+    context.user_data["session_id"] = session_id
+    
+    return SETUP_JIRA_USER
+
+async def setup_jira_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение Jira username"""
+    jira_user = update.message.text.strip()
+    session_id = context.user_data.get("session_id")
+    
+    if not session_id:
+        await update.message.reply_text("❌ Ошибка сессии. Начните заново: /setup")
+        return ConversationHandler.END
+    
+    # Обновляем сессию
+    db.update_session(session_id, step="setup_jira_token", data={"jira_user": jira_user})
+    
+    await update.message.reply_text(
+        f"✅ Username сохранен: {jira_user}\n\n"
+        "Шаг 2 из 2:\n"
+        "Отправьте мне ваш Jira API Token:\n\n"
+        "Как получить токен:\n"
+        "1. Откройте Jira в браузере\n"
+        "2. Профиль → Управление аккаунта\n"
+        "3. Безопасность → API токены\n"
+        "4. Создать токен\n\n"
+        "Внимание: Токен будет сохранен в зашифрованном виде."
+    )
+    
+    return SETUP_JIRA_TOKEN
+
+async def setup_jira_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение Jira токена и завершение настройки"""
+    jira_token = update.message.text.strip()
+    session_id = context.user_data.get("session_id")
+    
+    if not session_id:
+        await update.message.reply_text("❌ Ошибка сессии. Начните заново: /setup")
+        return ConversationHandler.END
+    
+    # Получаем данные из сессии
+    session = db.get_session(session_id)
+    if not session:
+        await update.message.reply_text("❌ Сессия устарела. Начните заново: /setup")
+        return ConversationHandler.END
+    
+    jira_user = session["data"].get("jira_user")
+    user_id = session["user_id"]
+    
+    # Тестируем подключение
+    await update.message.reply_text("🔄 Проверяю подключение к Jira...")
+    
+    # ПРОВЕРКА подключения
+    if jira_manager.test_user_connection(user_id, jira_user, jira_token):
+        # Сохраняем credentials
+        db.update_user_jira_credentials(user_id, jira_user, jira_token)
+        
+        # Создаем клиент
+        jira_manager.create_client(user_id, jira_user, jira_token)
+        
+        await update.message.reply_text(
+            "✅ Подключение к Jira успешно настроено!\n\n"
+            f"Напоминания будут приходить каждые {REMINDER_INTERVAL_MINUTES} минут, если не подтвердить уведомление.\n"
+            "Ночью (22:00-09:00 МСК) напоминания приостанавливаются.\n\n"
+            f"Бот также будет проверять упоминания @{jira_user} каждые {MENTIONS_CHECK_INTERVAL} минут.\n\n"
+            "Теперь вы можете:\n"
+            "• /addfilter - Добавить фильтр для отслеживания\n"
+            "• /filters - Просмотреть ваши фильтры\n"
+            "• /checkmentions - Проверить упоминания\n"
+            "• /help - Все команды"
+        )
+        
+        # Удаляем сессию
+        db.delete_session(session_id)
+        if "session_id" in context.user_data:
+            del context.user_data["session_id"]
+        
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "❌ Не удалось подключиться к Jira\n\n"
+            "Проверьте:\n"
+            "1. Правильность username и токена\n"
+            "2. Доступность Jira сервера\n"
+            "3. Не истек ли срок действия токена\n\n"
+            "Попробуйте снова: /setup"
+        )
+        
+        # Удаляем сессию
+        db.delete_session(session_id)
+        if "session_id" in context.user_data:
+            del context.user_data["session_id"]
+        
+        return ConversationHandler.END
+
+async def reconfigure_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перенастройка Jira подключения"""
+    user_data = await get_user_data(update)
+    
+    # Удаляем старые credentials
+    db.update_user_jira_credentials(user_data["user_id"], None, None)
+    jira_manager.remove_client(user_data["user_id"])
+    
+    await update.message.reply_text(
+        "🔄 Настройки Jira сброшены.\n\n"
+        "Теперь настройте заново: /setup"
+    )
+
+# ------------------- Команды для фильтров -------------------
+async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление нового фильтра"""
+    user_data = await get_user_data(update)
+    
+    # Проверяем, настроен ли Jira
+    if not user_data.get("jira_user") or not user_data.get("jira_token"):
+        await update.message.reply_text(
+            "❌ Сначала настройте подключение к Jira:\n/setup"
+        )
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📋 Добавление нового фильтра\n\n"
+        "Примеры JQL для отслеживания блокировок:\n"
+        "-- Все заблокированные задачи, назначенные на меня\n"
+        "assignee = currentUser() AND resolution = Unresolved AND issuelinks in blocks()\n\n"
+        "-- Задачи, которые я блокирую\n"
+        "issuelinks in outwards('Blocks') AND resolution = Unresolved\n\n"
+        "-- Активные блокировки в проекте\n"
+        "project = PROJ AND status in ('Блокировано', 'В ожидании') AND resolution = Unresolved\n\n"
+        "Шаг 1 из 2:\n"
+        "Отправьте мне название фильтра (например: Мои блокировки, Блокирующие задачи и т.д.):"
+    )
+    
+    # Создаем сессию
+    session_id = db.create_session(
+        user_id=user_data["user_id"],
+        step="add_filter_name"
+    )
+    context.user_data["session_id"] = session_id
+    
+    return ADD_FILTER_NAME
+
+async def add_filter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение названия фильтра"""
+    filter_name = update.message.text.strip()
+    session_id = context.user_data.get("session_id")
+    
+    if not session_id:
+        await update.message.reply_text("❌ Ошибка сессии. Начните заново: /addfilter")
+        return ConversationHandler.END
+    
+    # Обновляем сессию
+    db.update_session(session_id, step="add_filter_jql", data={"filter_name": filter_name})
+    
+    await update.message.reply_text(
+        f"✅ Название сохранено: {filter_name}\n\n"
+        "Шаг 2 из 2:\n"
+        "Отправьте мне JQL запрос для этого фильтра.\n\n"
+        "Примеры JQL для блокировок:\n"
+        "assignee = currentUser() AND resolution = Unresolved AND issuelinks in blocks()\n"
+        "project = PROJ AND status = Блокировано\n"
+        "created >= -7d AND issuelinks is not empty ORDER BY created DESC\n\n"
+        f"Фильтр будет проверяться каждые {DEFAULT_CHECK_INTERVAL} минут.\n"
+        "Бонус: Бот автоматически проанализирует все связанные блокирующие задачи!"
+    )
+    
+    return ADD_FILTER_JQL
+
+async def add_filter_jql(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение JQL и сохранение фильтра"""
+    jql = update.message.text.strip()
+    session_id = context.user_data.get("session_id")
+    
+    if not session_id:
+        await update.message.reply_text("❌ Ошибка сессии. Начните заново: /addfilter")
+        return ConversationHandler.END
+    
+    # Получаем данные из сессии
+    session = db.get_session(session_id)
+    if not session:
+        await update.message.reply_text("❌ Сессия устарела. Начните заново: /addfilter")
+        return ConversationHandler.END
+    
+    filter_name = session["data"].get("filter_name")
+    user_id = session["user_id"]
+    
+    # Сохраняем фильтр
+    if db.add_user_filter(user_id, filter_name, jql):
+        await update.message.reply_text(
+            f"✅ Фильтр добавлен!\n\n"
+            f"Название: {filter_name}\n"
+            f"JQL: {jql[:100]}{'...' if len(jql) > 100 else ''}\n\n"
+            f"Теперь бот будет проверять этот фильтр каждые {DEFAULT_CHECK_INTERVAL} минут.\n"
+            f"Напоминания будут приходить каждые {REMINDER_INTERVAL_MINUTES} минут, если не подтвердить.\n\n"
+            f"Особенность: Бот автоматически проанализирует все блокирующие задачи!"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка при добавлении фильтра\n\n"
+            "Возможно, фильтр с таким названием уже существует.\n"
+            "Попробуйте снова: /addfilter"
+        )
+    
+    # Удаляем сессию
+    db.delete_session(session_id)
+    if "session_id" in context.user_data:
+        del context.user_data["session_id"]
+    
+    return ConversationHandler.END
+
+async def filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать фильтры пользователя"""
+    user_data = await get_user_data(update)
+    user_filters = db.get_user_filters(user_data["user_id"], active_only=False)
+    
+    if not user_filters:
+        await update.message.reply_text(
+            "📭 У вас нет фильтров.\n\n"
+            "Добавьте первый фильтр: /addfilter\n\n"
+            "Совет: Используйте JQL с issuelinks для отслеживания блокировок!"
+        )
+        return
+    
+    text = "📋 <b>Ваши фильтры:</b>\n\n"
+    
+    for i, f in enumerate(user_filters, 1):
+        status = "🟢" if f["is_active"] else "🔴"
+        retention = f.get('retention_days') or 30  # Получаем дни или 30 по умолчанию
+        
+        text += f"{i}. {status} <b>{clean_text(f['filter_name'])}</b>\n"
+        text += f"   Интервал: {f['check_interval']} мин\n"
+        text += f"   Сброс (очистка): каждые {retention} дней\n"
+        text += f"   JQL: <code>{clean_text(f['jql'][:50])}...</code>\n\n"
+    
+    text += "<b>Команды управления:</b>\n"
+    text += "• /deletefilter &lt;название&gt; - Удалить фильтр\n"
+    text += "• /togglefilter &lt;название&gt; - Вкл/выкл фильтр\n"
+    text += "• /interval &lt;название&gt; &lt;минуты&gt; - Изменить интервал\n"
+    text += "• /retention &lt;название&gt; &lt;дни&gt; - Срок сброса задач\n"
+    text += "• /addfilter - Добавить новый фильтр\n\n"
+    text += "<b>Для анализа блокировок:</b>\n"
+    text += "• /blockers - Показать активные блокировки\n"
+    text += "• /blockersinfo TASK-123 - Анализ для конкретной задачи"
+    
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def deletefilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить фильтр"""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите название фильтра:\n/deletefilter НАЗВАНИЕ"
+        )
+        return
+    
+    user_data = await get_user_data(update)
+    filter_name = " ".join(context.args)
+    
+    if db.delete_user_filter(user_data["user_id"], filter_name):
+        await update.message.reply_text(f"✅ Фильтр '{clean_text(filter_name)}' удален.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Фильтр '{clean_text(filter_name)}' не найден.", parse_mode=ParseMode.HTML)
+
+async def togglefilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить/выключить фильтр"""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите название фильтра:\n/togglefilter НАЗВАНИЕ"
+        )
+        return
+    
+    user_data = await get_user_data(update)
+    filter_name = " ".join(context.args)
+    
+    # Получаем текущее состояние
+    filters = db.get_user_filters(user_data["user_id"], active_only=False)
+    target_filter = next((f for f in filters if f["filter_name"] == filter_name), None)
+    
+    if not target_filter:
+        await update.message.reply_text(f"❌ Фильтр '{clean_text(filter_name)}' не найден.", parse_mode=ParseMode.HTML)
+        return
+    
+    new_state = not target_filter["is_active"]
+    
+    if db.toggle_filter_active(user_data["user_id"], filter_name, new_state):
+        status = "включен" if new_state else "выключен"
+        await update.message.reply_text(f"✅ Фильтр '{clean_text(filter_name)}' {status}.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Ошибка изменения фильтра '{clean_text(filter_name)}'.", parse_mode=ParseMode.HTML)
+
+async def interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Изменить интервал проверки фильтра"""
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Укажите название фильтра и интервал:\n/interval НАЗВАНИЕ МИНУТЫ"
+        )
+        return
+    
+    user_data = await get_user_data(update)
+    filter_name = context.args[0]
+    
+    try:
+        interval = int(context.args[1])
+        if interval < 1 or interval > 1440:  # максимум 24 часа
+            await update.message.reply_text("❌ Интервал должен быть от 1 до 1440 минут.")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Укажите число минут.")
+        return
+    
+    if db.update_filter_interval(user_data["user_id"], filter_name, interval):
+        await update.message.reply_text(
+            f"✅ Интервал для фильтра '{clean_text(filter_name)}' изменен на {interval} мин.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(f"❌ Фильтр '{clean_text(filter_name)}' не найден.", parse_mode=ParseMode.HTML)
+
+async def retention_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Изменить срок хранения (очистки) для фильтра"""
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Укажите название фильтра и количество дней:\n/retention НАЗВАНИЕ ДНИ\n\n"
+            "Пример: /retention Мои задачи 10"
+        )
+        return
+    
+    user_data = await get_user_data(update)
+    
+    # Парсим аргументы (последний аргумент - дни, все что до - название фильтра)
+    try:
+        days = int(context.args[-1])
+        if days < 1 or days > 365:
+            await update.message.reply_text("❌ Количество дней должно быть от 1 до 365.")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Последним аргументом должно быть число дней.")
+        return
+        
+    filter_name = " ".join(context.args[:-1])
+    
+    if db.update_filter_retention(user_data["user_id"], filter_name, days):
+        await update.message.reply_text(
+            f"✅ Срок сброса для фильтра '<b>{clean_text(filter_name)}</b>' установлен на {days} дней.\n"
+            f"Теперь задачи старше {days} дней будут считаться новыми и вы снова получите по ним уведомления.", 
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(f"❌ Фильтр '{clean_text(filter_name)}' не найден.", parse_mode=ParseMode.HTML)
+
+# ------------------- Команды для работы с блокировками (FIXED) -------------------
+async def blockers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать все активные блокировки (с разбивкой на сообщения при превышении лимита)"""
+    user_data = await get_user_data(update)
+    user_id = user_data["user_id"]
+    
+    # Получаем все активные задачи пользователя
+    filters = db.get_user_filters(user_id, active_only=True)
+    
+    if not filters:
+        await update.message.reply_text(
+            "❌ У вас нет активных фильтров.\n\n"
+            "Добавьте фильтр для отслеживания блокировок: /addfilter"
+        )
+        return
+    
+    all_blockers = []
+    
+    # Используем правильный метод get_user_notifications
+    notifications = db.get_user_notifications(user_id, limit=200)
+    
+    for filter_data in filters:
+        filter_name = filter_data["filter_name"]
+        filter_notifications = [n for n in notifications if n["filter_name"] == filter_name]
+        
+        for notif in filter_notifications:
+            details = notif.get("details", {})
+            blockers = details.get("blockers", [])
+            
+            for blocker in blockers:
+                if not blocker.get("is_resolved", True):  # Только активные блокировки
+                    blocker_info = {
+                        "blocker_key": blocker["key"],
+                        "blocked_issue": notif["issue_key"],
+                        "filter_name": filter_name,
+                        "status": blocker["status"],
+                        "assignee": blocker["assignee"],
+                        "summary": blocker.get("summary", "Без названия"),
+                        "updated": blocker.get("updated"),
+                        "notification_time": notif["created_at"]
+                    }
+                    all_blockers.append(blocker_info)
+    
+    if not all_blockers:
+        await update.message.reply_text(
+            "✅ У вас нет активных блокирующих задач.\n\n"
+            "Все связанные задачи решены или в работе.\n\n"
+            "Совет: Добавьте фильтр для отслеживания блокировок:\n"
+            "assignee = currentUser() AND resolution = Unresolved AND issuelinks in blocks()"
+        )
+        return
+    
+    # Группируем блокировки по назначенному
+    blockers_by_assignee = {}
+    for blocker in all_blockers:
+        assignee = blocker["assignee"]
+        if assignee not in blockers_by_assignee:
+            blockers_by_assignee[assignee] = []
+        blockers_by_assignee[assignee].append(blocker)
+    
+    # --- ЛОГИКА РАЗБИЕНИЯ СООБЩЕНИЙ ---
+    messages_to_send = []
+    current_message = "🚨 Активные блокирующие задачи:\n\n"
+    
+    for assignee, blockers in blockers_by_assignee.items():
+        # Формируем блок для одного исполнителя
+        assignee_block = f"👤 {assignee}: {len(blockers)} задач\n"
+        
+        for blocker in blockers[:5]:  # Показываем первые 5
+            item_text = f"  • {blocker['blocker_key']} → блокирует {blocker['blocked_issue']}\n"
+            item_text += f"    Статус: {blocker['status']}\n"
+            item_text += f"    Фильтр: {blocker['filter_name']}\n"
+            item_text += f"    Обновлено: {blocker['updated']}\n"
+            
+            # Проверяем, влезет ли этот item в блок (редко, но бывает)
+            if len(assignee_block) + len(item_text) > 3500:
+                 pass
+            assignee_block += item_text
+        
+        if len(blockers) > 5:
+            assignee_block += f"  ... и еще {len(blockers) - 5}\n"
+        
+        assignee_block += "\n"
+        
+        # Проверяем, влезает ли блок в текущее сообщение
+        if len(current_message) + len(assignee_block) > 4000:
+            # Если не влезает, сохраняем текущее сообщение и начинаем новое
+            messages_to_send.append(current_message)
+            current_message = assignee_block
+        else:
+            current_message += assignee_block
+    
+    # Добавляем итог в последнее сообщение
+    summary_text = f"\n📊 Всего активных блокировок: {len(all_blockers)}"
+    if len(current_message) + len(summary_text) > 4000:
+        messages_to_send.append(current_message)
+        current_message = summary_text
+    else:
+        current_message += summary_text
+        
+    messages_to_send.append(current_message)
+    
+    # Создаем клавиатуру с кнопками для быстрого доступа
+    reply_markup = None
+    keyboard = []
+    
+    # Добавляем кнопки для самых активных блокировщиков
+    sorted_assignees = sorted(blockers_by_assignee.items(), key=lambda x: len(x[1]), reverse=True)
+    for assignee, blockers in sorted_assignees[:3]:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"👤 {assignee[:20]}: {len(blockers)} блокировок",
+                callback_data=f"assignee_{assignee[:30]}"
+            )
+        ])
+    
+    if keyboard:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Отправляем сообщения по очереди
+    for i, msg_text in enumerate(messages_to_send):
+        # Кнопки цепляем только к последнему сообщению
+        is_last_message = (i == len(messages_to_send) - 1)
+        markup = reply_markup if is_last_message else None
+        
+        try:
+            await update.message.reply_text(msg_text, reply_markup=markup)
+            # Небольшая пауза, чтобы порядок сообщений не сбился
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error sending blocker list part {i}: {e}")
+            await update.message.reply_text("⚠️ Часть списка не удалось отправить из-за ошибки.")
+
+async def analyze_blockers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Анализ блокирующих задач для конкретной задачи"""
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите ключ задачи:\n/blockersinfo TASK-123"
+        )
+        return
+    
+    user_data = await get_user_data(update)
+    issue_key = context.args[0].upper()
+    
+    client = jira_manager.get_client(user_data["user_id"])
+    if not client:
+        await update.message.reply_text("❌ Не настроено подключение к Jira")
+        return
+    
+    await update.message.reply_text(f"🔄 Анализирую блокирующие задачи для {issue_key}...")
+    
+    try:
+        # ВЫЗОВ
+        issue = client.get_issue(issue_key)
+        if not issue:
+            await update.message.reply_text(f"❌ Задача {issue_key} не найдена")
+            return
+        
+        # АСИНХРОННЫЙ ВЫЗОВ (если метод асинхронный в watcher)
+        blockers_result = smart_watcher.analyze_blockers(
+            user_data["user_id"], 
+            "manual_check", 
+            issue, 
+            client
+        )
+        blockers = await blockers_result if inspect.iscoroutine(blockers_result) else blockers_result
+        
+        if not blockers:
+            text = f"✅ {issue_key} не имеет блокирующих задач\n\n"
+            text += "Эта задача не блокирует другие задачи и не заблокирована другими.\n\n"
+            text += f"Прямая ссылка: {client.base_url}/browse/{issue_key}"
+        else:
+            text = f"🔗 Связанные задачи для {issue_key}:\n\n"
+            
+            active_blockers = [b for b in blockers if not b.get("is_resolved", True)]
+            resolved_blockers = [b for b in blockers if b.get("is_resolved", False)]
+            
+            if active_blockers:
+                text += "🚨 Активные блокировки:\n"
+                for blocker in active_blockers:
+                    assignee_emoji = "👤" if blocker.get("assignee") and blocker["assignee"] != "Не назначен" else "👁"
+                    text += f"  • {blocker['key']}\n"
+                    text += f"    Сводка: {blocker['summary'][:80]}...\n"
+                    text += f"    Статус: {blocker['status']}\n"
+                    text += f"    {assignee_emoji} {blocker['assignee']}\n"
+                    text += f"    Обновлено: {blocker['updated']}\n\n"
+            
+            if resolved_blockers:
+                text += "✅ Разрешённые блокировки:\n"
+                for blocker in resolved_blockers:
+                    text += f"  • {blocker['key']}\n"
+                    text += f"    Сводка: {blocker['summary'][:80]}...\n"
+                    text += f"    Решение: {blocker.get('resolution', 'Завершена')}\n"
+                    text += f"    Обновлено: {blocker['updated']}\n\n"
+        
+        # Создаем клавиатуру с ссылками
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "📂 Открыть основную задачу",
+                    url=f"{client.base_url}/browse/{issue_key}"
+                )
+            ]
+        ]
+        
+        # Добавляем кнопки для блокирующих задач
+        if blockers:
+            keyboard.append([InlineKeyboardButton("🔗 Связанные задачи:", callback_data="noop")])
+            
+            for blocker in blockers[:3]:  # Первые 3 задачи
+                status_emoji = "✅" if blocker.get("is_resolved") else "🚨"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{status_emoji} {blocker['key']}",
+                        url=f"{client.base_url}/browse/{blocker['key']}"
+                    )
+                ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Error analyzing blockers: {e}")
+        await update.message.reply_text("❌ Ошибка при анализе блокирующих задач")
+
+# ------------------- Команды для работы с упоминаниями -------------------
+async def mentions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать последние упоминания (сгруппированные по задачам)"""
+    user_data = await get_user_data(update)
+    
+    if not MENTIONS_ENABLED:
+        await update.message.reply_text(
+            "🔔 Отслеживание упоминаний отключено в настройках бота."
+        )
+        return
+    
+    # Получаем данные об упоминаниях (сгруппированные по задачам)
+    notification_data = mentions_tracker.get_mention_notification_data(user_data["user_id"])
+    
+    if not notification_data:
+        await update.message.reply_text(
+            "📭 У вас нет новых упоминаний в задачах Jira.\n\n"
+            "Бот будет уведомлять вас автоматически, когда вас упомянут (@username) " 
+            "в комментариях или описаниях задач."
+        )
+        return
+    
+    text = "🔔 Ваши упоминания в задачах Jira:\n\n"
+    
+    for data in notification_data[:10]:  # Показываем первые 10 задач
+        issue_key = data["issue_key"]
+        total_mentions = data["total_mentions"]
+        mentioners = data.get("mentioners", [])
+        
+        text += f"📋 {issue_key} - {total_mentions} упоминаний\n"
+        
+        if mentioners:
+            text += f"   👤 Упомянули: {', '.join(mentioners[:3])}"
+            if len(mentioners) > 3:
+                text += f" и еще {len(mentioners) - 3}"
+            text += "\n"
+        
+        # Показываем пример последнего упоминания
+        if data.get("mentions"):
+            last_mention = data["mentions"][0]
+            mention_text = last_mention.get("mention_text", "")[:100]
+            if mention_text:
+                text += f"   💬 Последнее: {mention_text}...\n"
+        
+        text += f"   📅 Время: {data['last_mention'][:16]}\n\n"
+    
+    if len(notification_data) > 10:
+        text += f"\n... и еще {len(notification_data) - 10} задач с упоминаниями"
+    
+    text += "\n💡 Используйте /checkmentions для ручной проверки"
+    text += "\n📌 Для каждой задачи вы получите одно уведомление со всеми упоминаниями"
+    
+    await update.message.reply_text(text)
+
+async def checkmentions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вручную проверить упоминания"""
+    user_data = await get_user_data(update)
+    
+    if not MENTIONS_ENABLED:
+        await update.message.reply_text(
+            "🔔 Отслеживание упоминания отключено в настройках бота."
+        )
+        return
+    
+    client = jira_manager.get_client(user_data["user_id"])
+    if not client:
+        await update.message.reply_text(
+            "❌ Не настроено подключение к Jira.\n"
+            "Сначала настройте бота: /setup"
+        )
+        return
+    
+    await update.message.reply_text("🔄 Проверяю упоминания...")
+    
+    try:
+        # Получаем Jira username пользователя
+        user_info = db.get_user(user_data["user_id"])
+        jira_username = user_info.get("jira_user")
+        
+        if not jira_username:
+            await update.message.reply_text(
+                "❌ Не удалось определить ваш Jira username.\n"
+                "Проверьте настройки: /reconfigure"
+            )
+            return
+        
+        # ВЫЗОВ
+        mentions_result = mentions_tracker.check_user_mentions(
+            user_data["user_id"], 
+            client, 
+            jira_username
+        )
+        mentions = await mentions_result if inspect.iscoroutine(mentions_result) else mentions_result
+        
+        if not mentions:
+            await update.message.reply_text(
+                "✅ Новых упоминаний не найдено.\n\n"
+                "Бот будет уведомлять вас автоматически, когда вас упомянут (@username) " 
+                "в комментариях или описаниях задач."
+            )
+            return
+        
+        # Отправляем уведомления (теперь одно на задачу)
+        notified_count = 0
+        for mention_info in mentions:
+            message_id = await send_mention_notification(user_data["user_id"], mention_info)
+            if message_id:
+                notified_count += 1
+        
+        await update.message.reply_text(
+            f"✅ Найдено {len(mentions)} задач с упоминаниями.\n"
+            f"Отправлено {notified_count} уведомлений (по одному на задачу).\n\n"
+            f"📊 Всего упоминаний: {sum(m.get('total_mentions', 0) for m in mentions)}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error checking mentions: {e}")
+        await update.message.reply_text("❌ Ошибка при проверке упоминаний")
+
+# ------------------- Обновленный метод для отправки уведомлений об упоминаниях -------------------
+async def send_mention_notification(user_id: int, mention_info: Dict[str, Any]) -> Optional[int]:
+    """Отправить уведомление об упоминании (только если есть новые)"""
+    try:
+        issue = mention_info["issue"]
+        issue_key = mention_info["issue_key"]
+        fields = issue.get("fields", {})
+        mentions = mention_info.get("mentions", [])  # Все упоминания в этой задаче
+        total_mentions = mention_info.get("total_mentions", 0)
+        new_mentions_count = mention_info.get("new_mentions_count", total_mentions)  # Новых упоминаний
+        
+        if new_mentions_count == 0:
+            logger.info(f"📭 No NEW mentions for issue {issue_key}, skipping notification")
+            return None
+        
+        # Проверяем, отключены ли все уведомления
+        if user_muted.get(user_id, False):
+            logger.debug(f"🔇 Skipping mention notification for muted user {user_id}")
+            return None
+        
+        # Основные поля задачи
+        summary = fields.get("summary", "Без названия")
+        status = fields.get("status", {}).get("name", "Неизвестно")
+        priority = fields.get("priority", {}).get("name", "Не указан")
+        
+        # Получаем клиент для ссылки
+        client = jira_manager.get_client(user_id)
+        if not client:
+            return None
+        
+        # Группируем упоминания по типу и авторам
+        comment_mentions = [m for m in mentions if m.get("mention_type") == "comment"]
+        description_mentions = [m for m in mentions if m.get("mention_type") == "description"]
+        
+        # Собираем уникальных авторов
+        unique_mentioners = set()
+        for mention in mentions:
+            mention_details = mention.get("mention_details", {})
+            author = mention_details.get("author") or mention.get("mentioned_by")
+            if author:
+                unique_mentioners.add(clean_text(author))
+        
+        # Берем последний комментарий с упоминанием для примера
+        last_mention_text = ""
+        last_mention_author = ""
+        if comment_mentions:
+            last_mention = comment_mentions[0]
+            mention_details = last_mention.get("mention_details", {})
+            last_mention_text = mention_details.get("body", "")[:200]
+            last_mention_author = mention_details.get("author", "Неизвестно")
+            if len(mention_details.get("body", "")) > 200:
+                last_mention_text += "..."
+        elif description_mentions:
+            last_mention = description_mentions[0]
+            mention_details = last_mention.get("mention_details", {})
+            last_mention_text = mention_details.get("text", "")[:200]
+            last_mention_author = mention_details.get("author", "Неизвестно")
+            if len(mention_details.get("text", "")) > 200:
+                last_mention_text += "..."
+        
+        # Формируем сообщение с указанием количества НОВЫХ упоминаний
+        text = f"""🔔 Вас упомянули в задаче Jira
+
+Задача: {issue_key} ({client.base_url}/browse/{issue_key})
+Сводка: {clean_text(summary)}
+Статус: {clean_text(status)}
+Приоритет: {clean_text(priority)}
+
+📊 Новых упоминаний: {new_mentions_count} (всего: {total_mentions})
+👤 Упомянули: {', '.join(list(unique_mentioners)[:5])}{f' и еще {len(unique_mentioners) - 5}' if len(unique_mentioners) > 5 else ''}
+
+💬 Последнее упоминание от {clean_text(last_mention_author)}:
+{clean_text(last_mention_text)}
+
+💡 Нажмите на кнопку ниже, чтобы открыть задачу и увидеть все упоминания.
+"""
+        
+        # Создаем клавиатуру
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "📂 Открыть задачу",
+                    url=f"{client.base_url}/browse/{issue_key}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Увидел",
+                    callback_data=f"mention_ack_{issue_key}"
+                )
+            ]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Отправляем сообщение
+        message_id = await send_message_safe(
+            user_id=user_id,
+            text=text,
+            reply_markup=reply_markup
+        )
+        
+        if message_id:
+            logger.info(f"✅ Mention notification sent for {issue_key} ({new_mentions_count} NEW mentions) to user {user_id}")
+            
+            # Помечаем ВСЕ упоминания в этой задаче как отправленные
+            db.mark_mentions_as_notified(user_id, issue_key)
+            
+            return message_id
+        
+    except Exception as e:
+        logger.error(f"❌ Error sending mention notification: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    return None
+
+# ------------------- НОВЫЕ ФИЧИ (Дайджест и Инлайн) -------------------
+async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной вызов утреннего дайджеста"""
+    user_data = await get_user_data(update)
+    msg = await update.message.reply_text("🔄 Собираю твой дайджест...")
+    
+    text = await generate_user_digest(user_data["user_id"])
+    if text:
+        await msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    else:
+        await msg.edit_text("❌ Не удалось собрать данные. Jira настроена?")
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инлайн поиск задач: показывает статус, исполнителя и последний комментарий"""
+    query = update.inline_query.query.upper().strip()
+    
+    # Если запрос пустой или слишком короткий, не мучаем Jira
+    if len(query) < 3: 
+        return
+
+    user_id = update.effective_user.id
+    client = jira_manager.get_client(user_id)
+    
+    # Если клиент не инициализирован (пользователь не залогинился), ничего не показываем
+    if not client:
+        return
+
+    # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+    # Jira выдает ошибку 400, если искать key = "123" (без формата ПРОЕКТ-123).
+    # Поэтому добавляем условие: ищем по key только если есть дефис.
+    if "-" in query:
+        jql = f'(text ~ "{query}*" OR key = "{query}") ORDER BY updated DESC'
+    else:
+        # Ищем только по тексту (это включает поиск номера внутри ключа)
+        jql = f'text ~ "{query}*" ORDER BY updated DESC'
+    # ------------------------
+    
+    # Получаем задачи (max_results=10, чтобы был выбор)
+    try:
+        issues_result = client.search(jql, max_results=10)
+        issues = await issues_result if inspect.iscoroutine(issues_result) else issues_result
+    except Exception as e:
+        logger.error(f"Inline search error: {e}")
+        return
+    
+    results = []
+    for issue in issues:
+        # 1. Основные поля
+        key = issue.get("key")
+        fields = issue.get("fields", {})
+        summary = fields.get("summary", "Без названия")
+        status = fields.get("status", {}).get("name", "Неизвестно")
+        url = f"{client.base_url}/browse/{key}"
+        
+        # 2. Получаем исполнителя
+        assignee_obj = fields.get("assignee")
+        assignee_name = assignee_obj.get("displayName", "Не назначен") if assignee_obj else "Не назначен"
+        
+        # 3. Получаем последний комментарий
+        comments = fields.get("comment", {}).get("comments", [])
+        last_comment_text = ""
+        
+        if comments:
+            last_c = comments[-1]
+            author = last_c.get("author", {}).get("displayName", "Неизвестно")
+            body = last_c.get("body", "")
+            
+            # Обрезаем комментарий, если он длинный (до 150 символов)
+            if len(body) > 150:
+                body = body[:150] + "..."
+            
+            # Формируем блок комментария для сообщения
+            last_comment_text = f"\n\n💬 <b>{html.escape(author)}</b>:\n<i>{html.escape(body)}</i>"
+
+        # 4. Формируем текст сообщения, которое отправится в чат
+        message_text = (
+            f"📋 <b><a href='{url}'>{key}</a></b>\n"
+            f"{html.escape(summary)}\n\n"
+            f"📊 <b>Статус:</b> {status}\n"
+            f"👤 <b>Исполнитель:</b> {html.escape(assignee_name)}"
+            f"{last_comment_text}"
+        )
+        
+        # 5. Формируем описание для списка результатов (превью)
+        # В превью показываем: Исполнитель | Сводка
+        description_preview = f"👤 {assignee_name} | {summary}"
+        
+        results.append(
+            InlineQueryResultArticle(
+                id=key,
+                title=f"{key} — {status}",
+                description=description_preview,
+                input_message_content=InputTextMessageContent(
+                    message_text, 
+                    parse_mode=ParseMode.HTML, 
+                    disable_web_page_preview=True
+                )
+            )
+        )
+    
+    await update.inline_query.answer(results, cache_time=10)
+
+# ------------------- Основные команды -------------------
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус пользователя"""
+    user_data = await get_user_data(update)
+    stats = db.get_user_stats(user_data["user_id"])
+    
+    # Проверяем подключение к Jira
+    jira_configured = bool(user_data.get("jira_user") and user_data.get("jira_token"))
+    jira_status = "✅ Настроено" if jira_configured else "❌ Не настроено"
+    
+    muted_status = user_muted.get(user_data["user_id"], False)
+    
+    current_time = get_msk_time()
+    
+    # Получаем информацию о блокировках
+    filters = db.get_user_filters(user_data["user_id"], active_only=True)
+    total_blockers = 0
+    
+    if filters:
+        # Используем правильный метод
+        notifications = db.get_user_notifications(user_data["user_id"], limit=100)
+        
+        for filter_data in filters:
+            filter_name = filter_data["filter_name"]
+            filter_notifications = [n for n in notifications if n["filter_name"] == filter_name]
+            
+            for notif in filter_notifications:
+                details = notif.get("details", {})
+                blockers = details.get("blockers", [])
+                active_blockers = [b for b in blockers if not b.get("is_resolved", True)]
+                total_blockers += len(active_blockers)
+    
+    # Получаем количество непрочитанных упоминаний
+    mention_data = mentions_tracker.get_mention_notification_data(user_data["user_id"])
+    unread_mentions = len(mention_data) if mention_data else 0
+    
+    text = f"""
+📊 Ваш статус
+
+Jira: {jira_status}
+Уведомления: {'🔕 Выключены' if muted_status else '🔔 Включены'}
+Упоминания: {'🔔 Включены' if MENTIONS_ENABLED else '🔕 Выключены'}
+Текущее время: {current_time}
+
+📈 Статистика:
+• Фильтров: {stats.get('total_filters', 0)} (активных: {stats.get('active_filters', 0)})
+• Отслеживаемых задач: {stats.get('total_tracked', 0)}
+• Всего уведомлений: {stats.get('total_notifications', 0)}
+• Неподтвержденных: {stats.get('pending_notifications', 0)}
+• Непрочитанных упоминаний: {unread_mentions}
+• Активных блокировок: {total_blockers}
+
+⏰ Настройки:
+• Интервал напоминаний: {REMINDER_INTERVAL_MINUTES} минут
+• Интервал проверки упоминаний: {MENTIONS_CHECK_INTERVAL} минут
+• Ночной режим: {'🌙 Включен (22:00-09:00 МСК)' if should_send_reminder_check() else '☀️ Дневное время'}
+
+🔧 Управление:
+• /filters - Ваши фильтры
+• /blockers - Активные блокировки
+• /mentions - Ваши упоминания
+• /digest - Утренняя сводка
+• /mute - Вкл/выкл все уведомления
+• /stats - Подробная статистика
+• /pending - Неподтвержденные уведомления
+• /nightmode - Информация о ночном режиме
+"""
+    
+    await update.message.reply_text(text)
+
+async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить/выключить все уведомления"""
+    user_data = await get_user_data(update)
+    user_id = user_data["user_id"]
+    
+    current_state = user_muted.get(user_id, False)
+    user_muted[user_id] = not current_state
+    
+    status = "🔕 Все уведомления выключены" if user_muted[user_id] else "🔔 Все уведомления включены"
+    
+    await update.message.reply_text(status)
+    logger.info(f"User {user_id} muted: {user_muted[user_id]}")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подробная статистика"""
+    user_data = await get_user_data(update)
+    user_filters = db.get_user_filters(user_data["user_id"])
+    
+    text = "📈 Подробная статистика\n\n"
+    
+    if not user_filters:
+        text += "У вас пока нет фильтров.\nДобавьте первый: /addfilter"
+    else:
+        total_blockers = 0
+        active_blockers = 0
+        
+        # Используем правильный метод
+        notifications = db.get_user_notifications(user_data["user_id"], limit=100)
+        
+        for f in user_filters:
+            status = "🟢 Активен" if f["is_active"] else "🔴 Неактивен"
+            retention = f.get('retention_days') or 30
+            text += f"• {f['filter_name']} ({status})\n"
+            text += f"  Интервал: {f['check_interval']} мин\n"
+            text += f"  Очистка: каждые {retention} дней\n"
+            text += f"  JQL: {f['jql'][:60]}{'...' if len(f['jql']) > 60 else ''}\n"
+            
+            # Считаем блокировки для этого фильтра
+            filter_notifications = [n for n in notifications if n["filter_name"] == f["filter_name"]]
+            
+            filter_blockers = 0
+            filter_active = 0
+            
+            for notif in filter_notifications:
+                details = notif.get("details", {})
+                blockers = details.get("blockers", [])
+                filter_blockers += len(blockers)
+                filter_active += len([b for b in blockers if not b.get("is_resolved", True)])
+            
+            text += f"  Блокировок: {filter_blockers} (активных: {filter_active})\n\n"
+            
+            total_blockers += filter_blockers
+            active_blockers += filter_active
+        
+        text += f"\n📊 Общая статистика блокировок:\n"
+        text += f"• Всего связанных задач: {total_blockers}\n"
+        text += f"• Активных блокировок: {active_blockers}\n"
+        text += f"• Решённых: {total_blockers - active_blockers}\n\n"
+    
+    # Статистика упоминаний
+    mention_data = mentions_tracker.get_mention_notification_data(user_data["user_id"])
+    unread_mentions = len(mention_data) if mention_data else 0
+    total_mentions = db.get_total_mentions(user_data["user_id"])
+    
+    text += f"📨 Статистика упоминаний:\n"
+    text += f"• Всего упоминаний: {total_mentions}\n"
+    text += f"• Непрочитанных: {unread_mentions}"
+    
+    await update.message.reply_text(text)
+
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать неподтвержденные уведомления"""
+    user_data = await get_user_data(update)
+    pending = db.get_pending_notifications(user_data["user_id"])
+    
+    if not pending:
+        await update.message.reply_text("✅ У вас нет неподтвержденных уведомления.")
+        return
+    
+    text = "⏰ Неподтвержденные уведомления:\n\n"
+    
+    for i, p in enumerate(pending, 1):
+        text += f"{i}. {p['issue_key']} - {p['filter_name']}\n"
+        text += f"   Последнее уведомление: {p['last_notification']}\n"
+        text += f"   Уведомлений отправлено: {p['notification_count']}\n\n"
+    
+    text += "Подтвердите уведомления, нажав на кнопку '✅ Получил' под сообщениями от бота."
+    
+    await update.message.reply_text(text)
+
+async def nightmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о ночном режиме"""
+    from .config import NIGHT_MODE_ENABLED, NIGHT_START_HOUR, NIGHT_END_HOUR
+    
+    current_time = get_msk_time()
+    time_until_morning = format_time_until_morning()
+    
+    if NIGHT_MODE_ENABLED:
+        text = f"""
+🌙 Ночной режим бота
+
+Статус: Включен ✅
+Текущее время: {current_time}
+Ночное время: с {NIGHT_START_HOUR:02d}:00 до {NIGHT_END_HOUR:02d}:00 (МСК)
+
+В ночное время бот:
+• ✅ Отправляет уведомления о новых изменениях
+• ✅ Отправляет уведомления об упоминаниях
+• 🚫 Не отправляет напоминания о неподтвержденных задачах
+• 🔄 Продолжает отслеживать изменения в задачах
+• ⏰ Напоминания возобновятся автоматически в 09:00 МСК
+
+До утра: {time_until_morning}
+Интервал напоминаний: {REMINDER_INTERVAL_MINUTES} минут (в рабочее время)
+Интервал упоминаний: {MENTIONS_CHECK_INTERVAL} минут
+
+Команды:
+• /mute - полностью отключить уведомления
+• /pending - показать неподтвержденные задачи
+• /mentions - показать непрочитанные упоминания
+• /status - ваш текущий статус
+        """
+    else:
+        text = f"""
+🌙 Ночной режим бота
+
+Статус: Выключен 🔔
+Текущее время: {current_time}
+Интервал напоминаний: {REMINDER_INTERVAL_MINUTES} минут
+Интервал упоминаний: {MENTIONS_CHECK_INTERVAL} минут
+
+Бот работает в обычном режиме и отправляет напоминания круглосуточно.
+
+Чтобы включить ночной режим, установите в .env:
+NIGHT_MODE_ENABLED=true
+NIGHT_START_HOUR=22
+NIGHT_END_HOUR=9
+        """
+    
+    await update.message.reply_text(text)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь по командам"""
+    help_text = f"""
+📖 Команды Jira Monitor Bot
+
+Настройка:
+/setup - Настроить подключение к Jira
+/reconfigure - Перенастроить Jira
+
+Фильтры:
+/addfilter - Добавить новый фильтр
+/filters - Показать ваши фильтры
+/deletefilter <название> - Удалить фильтр
+/togglefilter <название> - Вкл/выкл фильтр
+/interval <название> <минуты> - Изменить интервал
+/retention <название> <дни> - Изменить срок сброса истории фильтра
+
+Блокирующие задачи:
+/blockers - Показать все активные блокировки
+/blockersinfo TASK-123 - Анализ блокировок для конкретной задачи
+
+Упоминания:
+/mentions - Показать ваши упоминания (одно уведомление на задачу)
+/checkmentions - Вручную проверить упоминания
+
+Управление и информация:
+/digest - Вызвать утреннюю сводку
+/status - Ваш статус
+/mute - Вкл/выкл все уведомления
+/pending - Показать неподтвержденные уведомления
+/stats - Подробная статистика
+/nightmode - Информация о ночном режиме
+/help - Эта справка
+
+📅 Расписание:
+• Первое уведомление - сразу при изменении
+• Напоминания - каждые {REMINDER_INTERVAL_MINUTES} минут в рабочее время
+• Упоминания - каждые {MENTIONS_CHECK_INTERVAL} минут
+• Утренний дайджест - 09:00 МСК
+• Ночное время (22:00-09:00 МСК) - напоминания не отправляются
+"""
+    
+    await update.message.reply_text(help_text)
+
+# ------------------- Админские команды -------------------
+async def adminstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика по всем пользователям (только для админов)"""
+    user_data = await get_user_data(update)
+    
+    # Импортируем NIGHT_MODE_ENABLED здесь, чтобы избежать циклического импорта
+    from .config import NIGHT_MODE_ENABLED, MENTIONS_ENABLED
+    
+    if user_data["user_id"] not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Эта команда только для администраторов.")
+        return
+    
+    active_users = db.get_all_active_users()
+    
+    text = f"""
+👑 Админская статистика
+
+Всего активных пользователей: {len(active_users)}
+Интервал напоминаний: {REMINDER_INTERVAL_MINUTES} минут
+Интервал упоминаний: {MENTIONS_CHECK_INTERVAL} минут
+Ночной режим: {'Включен' if NIGHT_MODE_ENABLED else 'Выключен'}
+Упоминания: {'Включены' if MENTIONS_ENABLED else 'Выключены'}
+
+Пользователи:
+"""
+    
+    for user in active_users:
+        stats = db.get_user_stats(user["user_id"])
+        username = user.get('username', 'нет')
+        first_name = user.get('first_name', 'Пользователь')
+        text += f"\n• {first_name} (@{username})\n"
+        text += f"  ID: {user['user_id']}\n"
+        text += f"  Фильтров: {stats.get('total_filters', 0)}\n"
+        text += f"  Задач: {stats.get('total_tracked', 0)}\n"
+        text += f"  Уведомлений: {stats.get('total_notifications', 0)}\n"
+        text += f"  Неподтвержденных: {stats.get('pending_notifications', 0)}\n"
+        text += f"  Упоминаний: {stats.get('mentions_count', 0)}\n"
+    
+    await update.message.reply_text(text)
+
+# --- НОВЫЕ АДМИНСКИЕ КОМАНДЫ (Broadcast / Send) ---
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Рассылка сообщения всем активным пользователям.
+    Использование: /broadcast Текст сообщения
+    """
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+
+    # Проверяем, есть ли текст
+    message = " ".join(context.args)
+    if not message:
+        await update.message.reply_text(
+            "❌ Введите текст сообщения.\nПример: /broadcast Внимание! Технические работы."
+        )
+        return
+
+    # Получаем список всех активных пользователей
+    active_users = db.get_all_active_users()
+    
+    await update.message.reply_text(f"🚀 Начинаю рассылку для {len(active_users)} пользователей...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for user in active_users:
+        try:
+            chat_id = user.get("chat_id")
+            if not chat_id:
+                continue
+                
+            # Добавляем пометку, что это сообщение от админа
+            text_to_send = f"📢 <b>Сообщение от администратора:</b>\n\n{html.escape(message)}"
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text_to_send,
+                parse_mode=ParseMode.HTML
+            )
+            success_count += 1
+            await asyncio.sleep(0.1) # Небольшая задержка, чтобы не спамить
+            
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user['user_id']}: {e}")
+            fail_count += 1
+            
+    await update.message.reply_text(
+        f"✅ Рассылка завершена.\n\n"
+        f"Отправлено: {success_count}\n"
+        f"Ошибок: {fail_count}"
+    )
+
+async def send_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отправка сообщения конкретному пользователю.
+    Использование: /send @username Текст сообщения
+    """
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Неверный формат.\nИспользование: /send @username Текст сообщения"
+        )
+        return
+
+    target_identifier = context.args[0]
+    message_text = " ".join(context.args[1:])
+    
+    # Ищем chat_id пользователя через новый метод в db
+    target_chat_id = db.get_user_chat_id(target_identifier)
+    
+    if not target_chat_id:
+        await update.message.reply_text(f"❌ Пользователь '{target_identifier}' не найден в базе бота (или не нажимал /start).")
+        return
+        
+    try:
+        text_to_send = f"📩 <b>Личное сообщение от администратора:</b>\n\n{html.escape(message_text)}"
+        
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=text_to_send,
+            parse_mode=ParseMode.HTML
+        )
+        await update.message.reply_text(f"✅ Сообщение отправлено пользователю {target_identifier}.")
+        
+    except Exception as e:
+        logger.error(f"Failed to send direct message: {e}")
+        await update.message.reply_text(f"❌ Ошибка отправки: {e}")
+
+# ------------------- НОВАЯ ФУНКЦИЯ: Уведомления с изменениями -------------------
+async def send_notification_with_changes(user_id: int, filter_name: str, 
+                                        change_info: Dict[str, Any], 
+                                        is_reminder: bool = False,
+                                        previous_message_id: Optional[int] = None) -> Optional[int]:
+    """Отправить уведомление с информацией об изменениях"""
+    # Проверяем, отключены ли все уведомления
+    if user_muted.get(user_id, False):
+        logger.debug(f"🔇 Skipping notification for muted user {user_id}")
+        return None
+    
+    issue = change_info["issue"]
+    issue_key = change_info["issue_key"]
+    change_type = change_info["change_type"]
+    notification_hash = change_info["notification_hash"]
+    blockers = change_info.get("blockers", [])
+    changes = change_info.get("changes", {})
+    
+    # Проверяем, не отключены ли уведомления для этой конкретной задачи
+    if db.is_task_muted(user_id, issue_key, filter_name):
+        logger.info(f"🔇 Task {issue_key} (filter: {filter_name}) is muted for user {user_id}")
+        return None
+    
+    # Проверяем, подтвердил ли пользователь уже это уведомление
+    if db.has_user_reacted(user_id, issue_key, notification_hash) and not is_reminder:
+        logger.debug(f"✅ User {user_id} already reacted to {issue_key}")
+        return None
+    
+    # Проверяем ночное время для напоминаний
+    if is_reminder and not should_send_reminder_check():
+        logger.info(f"🌙 Пропускаем напоминание для user {user_id} - ночное время по МСК")
+        return None
+    
+    try:
+        # Получаем Jira клиент пользователя
+        client = jira_manager.get_client(user_id)
+        if not client:
+            logger.error(f"❌ No Jira client for user {user_id}")
+            return None
+        
+        fields = issue.get("fields", {})
+        
+        # Основные поля
+        summary = fields.get("summary", "Без названия")
+        status = fields.get("status", {}).get("name", "Неизвестно")
+        priority = fields.get("priority", {}).get("name", "Не указан")
+        
+        # Назначенный
+        assignee_data = fields.get("assignee")
+        if assignee_data:
+            assignee = assignee_data.get("displayName", "Не назначен")
+        else:
+            assignee = "Не назначен"
+        
+        # Получаем описание изменений
+        title, changes_description = smart_watcher.get_change_description(changes)
+        
+        # Добавляем пометку о напоминании
+        if is_reminder:
+            title = f"⏰ Напоминание: {title.split(' ', 1)[1] if ' ' in title else title}"
+        
+        # Формируем раздел с подробными изменениями
+        changes_text = ""
+        if changes:
+            changes_text = "\n📋 Что изменилось:\n"
+            
+            if "status_changed" in changes:
+                status_info = changes["status_changed"]
+                from_status = status_info["from"] or "нет статуса"
+                to_status = status_info["to"] or "неизвестно"
+                changes_text += f"• 📊 Статус: {from_status} → {to_status}\n"
+                if status_info.get("is_resolved"):
+                    changes_text += f"  🎉 Задача завершена!\n"
+                elif status_info.get("is_unresolved"):
+                    changes_text += f"  ⚠️ Задача в проблемном статусе!\n"
+            
+            if "new_comments" in changes:
+                comments = changes["new_comments"]
+                changes_text += f"• 💬 Новых комментариев: {len(comments)}\n"
+                if comments:
+                    last_comment = comments[0]
+                    author = clean_text(last_comment.get("author", "Неизвестно"))
+                    body = clean_text(last_comment.get("body", "")[:150])
+                    changes_text += f"  👤 {author}: {body}...\n"
+            
+            if "new_links" in changes:
+                links = changes["new_links"]
+                changes_text += f"• 🔗 Новых связей: {len(links)}\n"
+                for link in links[:3]:  # Показываем первые 3
+                    link_type = link.get("type", "связь")
+                    direction = "→ блокирует" if link.get("direction") == "outward" else "← блокируется"
+                    changes_text += f"  {link['key']} ({link_type} {direction})\n"
+                if len(links) > 3:
+                    changes_text += f"  ... и еще {len(links) - 3}\n"
+            
+            if "assignee_changed" in changes:
+                assignee_info = changes["assignee_changed"]
+                from_assignee = assignee_info["from"] or "не назначен"
+                to_assignee = assignee_info["to"] or "не назначен"
+                
+                if assignee_info.get("was_unassigned"):
+                    changes_text += f"• 👤 Назначен исполнитель: {to_assignee}\n"
+                elif assignee_info.get("is_unassigned"):
+                    changes_text += f"• 👤 Исполнитель снят: {from_assignee}\n"
+                else:
+                    changes_text += f"• 👤 Исполнитель: {from_assignee} → {to_assignee}\n"
+            
+            if "priority_changed" in changes:
+                priority_info = changes["priority_changed"]
+                from_priority = priority_info["from"] or "не указан"
+                to_priority = priority_info["to"] or "не указан"
+                
+                if priority_info.get("priority_increased"):
+                    changes_text += f"• 🚨 Приоритет повышен: {from_priority} → {to_priority}\n"
+                else:
+                    changes_text += f"• 📋 Приоритет: {from_priority} → {to_priority}\n"
+            
+            if "blockers_resolved" in changes:
+                resolved_blockers = changes["blockers_resolved"]
+                changes_text += f"• 🎉 Разрешено блокирующих задач: {len(resolved_blockers)}\n"
+                for blocker in resolved_blockers[:2]:
+                    changes_text += f"  ✅ {blocker['key']}: {clean_text(blocker.get('summary', '')[:50])}...\n"
+                    changes_text += f"    Решение: {clean_text(blocker.get('resolution', 'Завершена'))}\n"
+                if len(resolved_blockers) > 2:
+                    changes_text += f"  ... и еще {len(resolved_blockers) - 2}\n"
+            
+            if "labels_changed" in changes:
+                labels_info = changes["labels_changed"]
+                if labels_info.get("added"):
+                    added = labels_info["added"][:3]
+                    if len(added) == 1:
+                        changes_text += f"• 🏷️ Добавлена метка: {added[0]}\n"
+                    else:
+                        changes_text += f"• 🏷️ Добавлены метки: {', '.join(added)}\n"
+                if labels_info.get("removed"):
+                    removed = labels_info["removed"][:3]
+                    if removed:
+                        changes_text += f"• 🗑️ Удалены метки: {', '.join(removed)}\n"
+            
+            if "due_date_changed" in changes:
+                due_info = changes["due_date_changed"]
+                if due_info["from"] and due_info["to"]:
+                    changes_text += f"• ⏰ Срок изменён: {due_info['from']} → {due_info['to']}\n"
+                elif due_info["to"]:
+                    changes_text += f"• ⏰ Установлен срок: {due_info['to']}\n"
+                elif due_info["from"] and not due_info["to"]:
+                    changes_text += f"• ⏰ Срок снят: {due_info['from']}\n"
+            
+            if "components_changed" in changes:
+                components_info = changes["components_changed"]
+                if components_info.get("added"):
+                    added = components_info["added"][:3]
+                    changes_text += f"• 🧩 Добавлены компоненты: {', '.join(added)}\n"
+                if components_info.get("removed"):
+                    removed = components_info["removed"][:3]
+                    if removed:
+                        changes_text += f"• 🗑️ Удалены компоненты: {', '.join(removed)}\n"
+        
+        # Блок с информацией о текущих блокирующих задачах
+        blockers_text = ""
+        active_blockers = [b for b in blockers if not b.get("is_resolved", True)]
+        resolved_blockers_list = [b for b in blockers if b.get("is_resolved", False)]
+        
+        if blockers:
+            blockers_text = "\n\n🔗 Текущие связанные задачи:\n"
+            
+            if active_blockers:
+                blockers_text += "🚨 Активные блокировки:\n"
+                for blocker in active_blockers[:3]:  # Ограничиваем количество
+                    assignee_emoji = "👤" if blocker.get("assignee") and blocker["assignee"] != "Не назначен" else "👁"
+                    blocker_summary = clean_text(blocker.get('summary', '')[:50])
+                    blockers_text += f"  • {blocker['key']}: {blocker_summary}...\n"
+                    blockers_text += f"    Статус: {clean_text(blocker['status'])}\n"
+                    blockers_text += f"    {assignee_emoji} {clean_text(blocker['assignee'])}\n"
+            
+            if resolved_blockers_list and not "blockers_resolved" in changes:
+                blockers_text += "\n✅ Разрешённые блокировки:\n"
+                for blocker in resolved_blockers_list[:2]:
+                    blocker_summary = clean_text(blocker.get('summary', '')[:50])
+                    blockers_text += f"  • {blocker['key']}: {blocker_summary}...\n"
+                    blockers_text += f"    Решение: {clean_text(blocker.get('resolution', 'Завершена'))}\n"
+            
+            if len(active_blockers) > 3 or len(resolved_blockers_list) > 2:
+                blockers_text += f"\n📊 Всего связанных задач: {len(blockers)}"
+        
+        # Формируем полный текст
+        safe_title = clean_text(title)
+        safe_filter_name = clean_text(filter_name)
+        safe_summary = clean_text(summary)
+        safe_status = clean_text(status)
+        safe_priority = clean_text(priority)
+        safe_assignee = clean_text(assignee)
+        
+        text = f"""{safe_title}
+
+Фильтр: {safe_filter_name}
+Задача: {issue_key} ({client.base_url}/browse/{issue_key})
+Сводка: {safe_summary}
+Статус: {safe_status}
+Приоритет: {safe_priority}
+Назначена: {safe_assignee}
+
+{changes_text}{blockers_text}
+
+💡 Нажмите на кнопку ниже, чтобы открыть задачу.
+"""
+        
+        # Создаем клавиатуру с кнопками
+        keyboard_buttons = []
+        
+        # Кнопка для основной задачи
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                "📂 Открыть в Jira",
+                url=f"{client.base_url}/browse/{issue_key}"
+            )
+        ])
+        
+        # Кнопки для блокирующих задач
+        if blockers:
+            keyboard_buttons.append([InlineKeyboardButton("🔗 Связанные задачи:", callback_data="noop")])
+            
+            # Убираем дубликаты при создании кнопок
+            seen_button_keys = set()
+            button_count = 0
+            
+            # Сначала показываем активные блокировки
+            for blocker in active_blockers:
+                blocker_key = blocker.get("key")
+                if blocker_key and blocker_key not in seen_button_keys:
+                    seen_button_keys.add(blocker_key)
+                    button_text = f"🚨 {blocker_key}"
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            button_text,
+                            url=f"{client.base_url}/browse/{blocker_key}"
+                        )
+                    ])
+                    button_count += 1
+                    if button_count >= 3:  # Максимум 3 кнопки
+                        break
+            
+            # Если есть разрешенные блокировки и место
+            if button_count < 3 and resolved_blockers_list:
+                for blocker in resolved_blockers_list:
+                    blocker_key = blocker.get("key")
+                    if blocker_key and blocker_key not in seen_button_keys:
+                        seen_button_keys.add(blocker_key)
+                        button_text = f"✅ {blocker_key}"
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                button_text,
+                                url=f"{client.base_url}/browse/{blocker_key}"
+                            )
+                        ])
+                        button_count += 1
+                        if button_count >= 3:
+                            break
+        
+        # Кнопки действий
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                "✅ Получил",
+                callback_data=f"ack_{issue_key}_{notification_hash}"
+            ),
+            InlineKeyboardButton(
+                "🔕 Не напоминать сутки",
+                callback_data=f"mute_{issue_key}_{filter_name}"
+            )
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard_buttons)
+        
+        # Отправляем сообщение
+        message_id = await send_message_safe(
+            user_id=user_id,
+            text=text,
+            reply_markup=reply_markup,
+            message_id=previous_message_id
+        )
+        
+        if message_id:
+            # Записываем уведомление
+            notification_details = {
+                "summary": safe_summary,
+                "status": safe_status,
+                "priority": safe_priority,
+                "assignee": safe_assignee,
+                "changes": changes,
+                "blockers_count": len(blockers),
+                "active_blockers": len(active_blockers),
+                "resolved_blockers": len(resolved_blockers_list),
+                "blockers": blockers,
+                "is_reminder": is_reminder,
+                "message_id": message_id,
+                "changes_description": changes_description
+            }
+            
+            db.record_notification(
+                user_id=user_id,
+                filter_name=filter_name,
+                issue_key=issue_key,
+                notification_hash=notification_hash,
+                change_type=change_type,
+                details=notification_details
+            )
+            
+            # Логируем в зависимости от типа изменений
+            change_types = list(changes.keys()) if changes else []
+            logger.info(f"✅ Notification sent to user {user_id}: {issue_key} with changes: {change_types}")
+            
+            return message_id
+        else:
+            logger.error(f"❌ Failed to send notification to user {user_id}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"❌ Error sending notification with changes: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+# ------------------- Проверка всех фильтров задачи -------------------
+async def check_all_task_mutes(user_id: int, issue_key: str) -> bool:
+    """
+    Проверить, отключена ли задача в ЛЮБОМ фильтре
+    """
+    # Получаем все уведомления по задаче
+    all_notifications = db.get_notifications_by_issue(user_id, issue_key)
+    
+    for notif in all_notifications:
+        filter_name = notif["filter_name"]
+        if db.is_task_muted(user_id, issue_key, filter_name):
+            logger.info(f"🔍 Task {issue_key} is muted in filter '{filter_name}'")
+            return True
+    
+    return False
+
+# ------------------- Проверка упоминаний пользователя -------------------
+async def check_user_mentions(user_id: int) -> int:
+    """Проверить упоминания пользователя (группированные по задачам)"""
+    if not MENTIONS_ENABLED:
+        return 0
+    
+    try:
+        client = jira_manager.get_client(user_id)
+        if not client:
+            return 0
+        
+        # Получаем Jira username пользователя
+        user_info = db.get_user(user_id)
+        jira_username = user_info.get("jira_user")
+        
+        if not jira_username:
+            return 0
+        
+        # ВЫЗОВ проверки упоминаний
+        mentions_result = mentions_tracker.check_user_mentions(user_id, client, jira_username)
+        mentions = await mentions_result if inspect.iscoroutine(mentions_result) else mentions_result
+        
+        if not mentions:
+            return 0
+        
+        # Отправляем уведомления (теперь одно на задачу)
+        notified_count = 0
+        for mention_info in mentions:
+            message_id = await send_mention_notification(user_id, mention_info)
+            if message_id:
+                notified_count += 1
+        
+        logger.info(f"✅ Sent {notified_count} mention notifications ({len(mentions)} tasks) to user {user_id}")
+        return notified_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error checking mentions for user {user_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 0
+
+# ------------------- Watcher -------------------
+async def check_user_filters(user_id: int) -> int:
+    """Проверить фильтры пользователя и отправить напоминания"""
+    try:
+        from .db import db
+        
+        user_filters = db.get_user_filters(user_id, active_only=True)
+        
+        if not user_filters:
+            return 0
+        
+        client = jira_manager.get_client(user_id)
+        if not client:
+            logger.error(f"❌ No Jira client for user {user_id}")
+            return 0
+        
+        total_notified = 0
+        
+        for filter_data in user_filters:
+            filter_name = filter_data["filter_name"]
+            jql = filter_data["jql"]
+            
+            try:
+                # logger.info(f"🔍 Checking filter '{filter_name}' for user {user_id}")
+                
+                # ВЫЗОВ поиска с деталями
+                issues_result = client.search_with_details(jql)
+                issues = await issues_result if inspect.iscoroutine(issues_result) else issues_result
+                
+                if not issues:
+                    # logger.debug(f"📭 No issues for filter '{filter_name}' (user {user_id})")
+                    continue
+                
+                # logger.info(f"📊 Found {len(issues)} issues for filter '{filter_name}' (user {user_id})")
+                
+                for issue in issues:
+                    issue_key = issue.get("key")
+                    
+                    is_task_muted = await check_all_task_mutes(user_id, issue_key)
+                    
+                    if is_task_muted:
+                        logger.info(f"🔇 SKIPPING ENTIRELY: Task {issue_key} is muted in SOME filter for user {user_id}")
+                        continue
+                    
+                    should_remind, previous_message_id = db.should_send_reminder(user_id, filter_name, issue_key)
+                    
+                    if should_remind:
+                        last_change_info = db.get_last_notification_info(user_id, filter_name, issue_key)
+                        
+                        if last_change_info:
+                            logger.info(f"⏰ Sending reminder for {issue_key} to user {user_id}")
+                            await send_notification_with_changes(
+                                user_id, 
+                                filter_name, 
+                                last_change_info,
+                                is_reminder=True,
+                                previous_message_id=previous_message_id
+                            )
+                            total_notified += 1
+                    
+                    # ВЫЗОВ проверки блокировщиков
+                    change_info_result = smart_watcher.detect_changes_with_blockers(user_id, filter_name, issue, client)
+                    change_info = await change_info_result if inspect.iscoroutine(change_info_result) else change_info_result
+                    
+                    if change_info:
+                        logger.info(f"📨 Change detected with blockers for user {user_id}: {change_info['issue_key']}")
+                        message_id = await send_notification_with_changes(user_id, filter_name, change_info)
+                        if message_id:
+                            total_notified += 1
+                        
+                        await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"❌ Error checking filter '{filter_name}' for user {user_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        return total_notified
+        
+    except Exception as e:
+        logger.error(f"❌ Error checking user {user_id} filters: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 0
+
+async def jira_watcher():
+    """Основной цикл проверки для всех пользователей (ПАРАЛЛЕЛЬНЫЙ)"""
+    logger.info("🚀 Starting multi-user Jira watcher with blocker tracking and mentions...")
+    await asyncio.sleep(10)
+    logger.info("✅ Watcher started successfully")
+    check_counter = 0
+    
+    while True:
+        try:
+            # logger.info(f"🔄 Starting check cycle #{check_counter} for all users...")
+            from .db import db
+            active_users = db.get_all_active_users()
+            
+            if not active_users:
+                logger.info("📭 No active users found")
+                await asyncio.sleep(60)
+                continue
+            
+            # logger.info(f"👥 Checking {len(active_users)} active users")
+            
+            # Семафор, чтобы не запрашивать Jira больше чем от 5 юзеров ОДНОВРЕМЕННО
+            semaphore = asyncio.Semaphore(5)
+            
+            async def process_user(user):
+                async with semaphore:
+                    user_id = user["user_id"]
+                    
+                    if not jira_manager.get_client(user_id):
+                        client_result = jira_manager.create_client(
+                            user_id=user_id,
+                            jira_user=user["jira_user"],
+                            jira_token=user["jira_token"]
+                        )
+                        if inspect.iscoroutine(client_result):
+                            await client_result
+                    
+                    mentions_notified = 0
+                    if MENTIONS_ENABLED and check_counter % max(1, MENTIONS_CHECK_INTERVAL // DEFAULT_CHECK_INTERVAL) == 0:
+                        mentions_notified = await check_user_mentions(user_id)
+                    
+                    f_notified = await check_user_filters(user_id)
+                    return f_notified, mentions_notified
+
+            # Запускаем все проверки пользователей ПАРАЛЛЕЛЬНО!
+            tasks = [process_user(u) for u in active_users]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            total_notified = 0
+            total_mentions = 0
+            
+            for r in results:
+                if isinstance(r, tuple):
+                    total_notified += r[0]
+                    total_mentions += r[1]
+                elif isinstance(r, Exception):
+                    logger.error(f"Error in user task: {r}")
+            
+            # logger.info(f"✅ Check cycle #{check_counter} completed. Notified: {total_notified}, Mentions: {total_mentions}")
+            check_counter += 1
+            await asyncio.sleep(DEFAULT_CHECK_INTERVAL * 60)
+            
+        except asyncio.CancelledError:
+            logger.info("🛑 Watcher cancelled")
+            break
+        except Exception as e:
+            logger.error(f"❌ Error in watcher loop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(60)
+
+# ------------------- Инициализация пользователей -------------------
+async def initialize_user_clients():
+    """Инициализировать Jira клиенты для всех пользователей при старте"""
+    from .db import db
+    active_users = db.get_all_active_users()
+    logger.info(f"🔧 Initializing Jira clients for {len(active_users)} users...")
+    
+    for user in active_users:
+        # ВЫЗОВ
+        client_result = jira_manager.create_client(
+            user_id=user["user_id"],
+            jira_user=user["jira_user"],
+            jira_token=user["jira_token"]
+        )
+        client = await client_result if inspect.iscoroutine(client_result) else client_result
+        
+        if client:
+            logger.info(f"✅ Client initialized for user {user['user_id']}")
+        else:
+            logger.error(f"❌ Failed to initialize client for user {user['user_id']}")
+    
+    logger.info("✅ User clients initialization completed")
+
+# ------------------- Основной цикл -------------------
+async def main():
+    """Основная функция запуска бота"""
+    global bot_app, watcher_task, digest_task
+    
+    try:
+        logger.info("🤖 Starting Multi-User Jira Telegram Bot with blocker tracking and mentions...")
+        
+        logger.info(f"📂 Current working directory: {os.getcwd()}")
+        
+        backup_path = db.backup_database()
+        logger.info(f"📦 Database backup created: {backup_path}")
+        
+        db.cleanup_old_data(days=30)
+        
+        bot_app = Application.builder().token(BOT_TOKEN).build()
+        
+        setup_conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("setup", setup_cmd)],
+            states={
+                SETUP_JIRA_USER: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, setup_jira_user)
+                ],
+                SETUP_JIRA_TOKEN: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, setup_jira_token)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        )
+        
+        addfilter_conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("addfilter", addfilter_cmd)],
+            states={
+                ADD_FILTER_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, add_filter_name)
+                ],
+                ADD_FILTER_JQL: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, add_filter_jql)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        )
+        
+        bot_app.add_handler(setup_conv_handler)
+        bot_app.add_handler(addfilter_conv_handler)
+        bot_app.add_handler(CommandHandler("start", start))
+        bot_app.add_handler(CommandHandler("reconfigure", reconfigure_cmd))
+        bot_app.add_handler(CommandHandler("filters", filters_cmd))
+        bot_app.add_handler(CommandHandler("deletefilter", deletefilter_cmd))
+        bot_app.add_handler(CommandHandler("togglefilter", togglefilter_cmd))
+        bot_app.add_handler(CommandHandler("interval", interval_cmd))
+        bot_app.add_handler(CommandHandler("retention", retention_cmd))
+        bot_app.add_handler(CommandHandler("status", status_cmd))
+        bot_app.add_handler(CommandHandler("mute", mute_cmd))
+        bot_app.add_handler(CommandHandler("stats", stats_cmd))
+        bot_app.add_handler(CommandHandler("pending", pending_cmd))
+        bot_app.add_handler(CommandHandler("nightmode", nightmode_cmd))
+        bot_app.add_handler(CommandHandler("help", help_cmd))
+        bot_app.add_handler(CommandHandler("adminstats", adminstats_cmd))
+        
+        # --- [NEW] Регистрация админских команд ---
+        bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+        bot_app.add_handler(CommandHandler("send", send_user_cmd))
+        # ------------------------------------------
+        
+        bot_app.add_handler(CommandHandler("blockers", blockers_cmd))
+        bot_app.add_handler(CommandHandler("blockersinfo", analyze_blockers_cmd))
+        
+        bot_app.add_handler(CommandHandler("mentions", mentions_cmd))
+        bot_app.add_handler(CommandHandler("checkmentions", checkmentions_cmd))
+        
+        bot_app.add_handler(CallbackQueryHandler(handle_reaction_callback))
+        
+        # НОВЫЕ ХЕНДЛЕРЫ
+        bot_app.add_handler(CommandHandler("digest", digest_cmd))
+        bot_app.add_handler(InlineQueryHandler(inline_query_handler))
+        
+        await bot_app.initialize()
+        await bot_app.start()
+        await bot_app.updater.start_polling()
+        
+        logger.info("✅ Telegram bot started and listening")
+        
+        await initialize_user_clients()
+        
+        # Запускаем фоновые задачи
+        watcher_task = asyncio.create_task(jira_watcher())
+        digest_task = asyncio.create_task(daily_digest_scheduler(bot_app))
+        
+        logger.info("✅ Bot is fully operational with blocker tracking, mentions, digests and inline mode!")
+        
+        # Ждем выполнения обеих задач
+        await asyncio.gather(watcher_task, digest_task)
+        
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"💥 Fatal error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("🧹 Cleaning up...")
+        
+        if watcher_task and not watcher_task.done():
+            watcher_task.cancel()
+            try:
+                await watcher_task
+            except asyncio.CancelledError:
+                pass
+                
+        if digest_task and not digest_task.done():
+            digest_task.cancel()
+            try:
+                await digest_task
+            except asyncio.CancelledError:
+                pass
+        
+        if bot_app:
+            await bot_app.stop()
+        
+        db.close()
+        logger.info("👋 Bot stopped")
+
+if __name__ == "__main__":
+    asyncio.run(main())
