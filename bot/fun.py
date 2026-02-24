@@ -1,4 +1,5 @@
 # bot/fun.py
+
 import os
 import re
 import socket
@@ -9,9 +10,20 @@ import asyncio
 import html as html_lib
 from collections import OrderedDict
 from datetime import date, datetime
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, Dict, Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+
+# ===================== Backward compatibility =====================
+
+# Раньше использовалось для генерации подписей/ролей. Оставляем, чтобы не падали импорты.
+ROLE_PREFIX = {
+    "common": "",
+    "dev": "👨‍💻 ",
+    "manager": "📊 ",
+    "boss": "👑 ",
+}
 
 # ===================== HTTP helper with retry =====================
 
@@ -39,10 +51,15 @@ async def close_http_client():
     global _http_client
     if _http_client:
         await _http_client.aclose()
-        _http_client = None
+    _http_client = None
 
 
-async def _fetch(url: str, params: Optional[dict] = None, timeout: float = 15.0, retries: int = 3) -> Optional[str]:
+async def _fetch(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: float = 15.0,
+    retries: int = 3,
+) -> Optional[str]:
     """
     Единая точка для вызовов внешних HTTP.
     """
@@ -53,7 +70,7 @@ async def _fetch(url: str, params: Optional[dict] = None, timeout: float = 15.0,
             resp.raise_for_status()
             return resp.text
         except Exception as e:
-            wait = (2 ** attempt) + (0.1 * attempt)
+            wait = (2**attempt) + (0.1 * attempt)
             logger.warning(
                 "External call failed (%s), retry %s/%s in %.1fs: %s",
                 url,
@@ -69,7 +86,12 @@ async def _fetch(url: str, params: Optional[dict] = None, timeout: float = 15.0,
     return None
 
 
-async def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 15.0, retries: int = 3) -> Optional[dict]:
+async def _fetch_json(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: float = 15.0,
+    retries: int = 3,
+) -> Optional[dict]:
     client = await get_http_client()
     for attempt in range(retries):
         try:
@@ -77,7 +99,7 @@ async def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            wait = (2 ** attempt) + (0.1 * attempt)
+            wait = (2**attempt) + (0.1 * attempt)
             logger.warning(
                 "External API call failed (%s), retry %s/%s in %.1fs: %s",
                 url,
@@ -94,27 +116,42 @@ async def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 
 
 
 # ===================== SETTINGS =====================
+
 # По умолчанию RU-источники -> без переводчика
-FUN_FACT_SOURCE = os.getenv("FUN_FACT_SOURCE", "ru").lower()         # ru | en
-FUN_HORO_SOURCE = os.getenv("FUN_HORO_SOURCE", "ru").lower()         # ru | en
+FUN_FACT_SOURCE = os.getenv("FUN_FACT_SOURCE", "ru").lower()  # ru | en
+FUN_HORO_SOURCE = os.getenv("FUN_HORO_SOURCE", "ru").lower()  # ru | en
 
 # Переводчик (опционально; если включишь EN источники)
-TRANSLATE_ENABLED = os.getenv("TRANSLATE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+TRANSLATE_ENABLED = os.getenv("TRANSLATE_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Yandex Cloud Translate (опционально)
 YC_API_KEY = (os.getenv("YC_API_KEY") or "").strip()
 YC_IAM_TOKEN = (os.getenv("YC_IAM_TOKEN") or "").strip()
 YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
-YC_TRANSLATE_URL = os.getenv("YC_TRANSLATE_URL", "https://translate.api.cloud.yandex.net/translate/v2/translate").strip()
+YC_TRANSLATE_URL = os.getenv(
+    "YC_TRANSLATE_URL",
+    "https://translate.api.cloud.yandex.net/translate/v2/translate",
+).strip()
 
 _translate_cache: "OrderedDict[tuple[str, str, str], str]" = OrderedDict()
-TRANSLATE_CACHE_ENABLED = os.getenv("TRANSLATE_CACHE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+TRANSLATE_CACHE_ENABLED = os.getenv("TRANSLATE_CACHE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 TRANSLATE_CACHE_MAX_ITEMS = int(os.getenv("TRANSLATE_CACHE_MAX_ITEMS", "2000"))
 
-# cache: key -> (date_iso, text)
+# horoscope cache: key -> (date_iso, text)
 _horoscope_cache: Dict[str, Tuple[str, str]] = {}
 
 # ===================== ZODIAC MAP =====================
+
 # Под RU-гороскоп Mail.ru нужны EN-ключи (aries, taurus, ...)
 ZODIAC_MAP = {
     "овен": "aries",
@@ -131,11 +168,10 @@ ZODIAC_MAP = {
     "рыбы": "pisces",
 }
 
-
 # ===================== TEXT HELPERS =====================
 
-_RE_SCRIPT = re.compile(r"<script\b[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
-_RE_STYLE = re.compile(r"<style\b[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
+_RE_SCRIPT = re.compile(r"<script[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
+_RE_STYLE = re.compile(r"<style[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
 _RE_TAGS = re.compile(r"<[^>]+>")
 _RE_WS = re.compile(r"[ \t\r\f\v]+")
 
@@ -144,17 +180,22 @@ def _html_to_text(s: str) -> str:
     """
     Простой html->text без внешних библиотек:
     - выкидываем script/style
-    - превращаем </p>, <br> и т.п. в переводы строк
+    - превращаем <br>, </p>, </div> и т.п. в переводы строк
     - удаляем теги
     - html-unescape
     """
     if not s:
         return ""
+
     s = _RE_SCRIPT.sub(" ", s)
     s = _RE_STYLE.sub(" ", s)
-    s = re.sub(r"(?i)</p\s*>", "\n", s)
+
+    # переносы строк для типовых блочных/разрывных тегов
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</p\s*>", "\n", s)
     s = re.sub(r"(?i)</div\s*>", "\n", s)
+    s = re.sub(r"(?i)</li\s*>", "\n", s)
+
     s = _RE_TAGS.sub(" ", s)
     s = html_lib.unescape(s)
     s = s.replace("\u00a0", " ")
@@ -182,6 +223,7 @@ def _yc_ready() -> bool:
         return False
     if not (YC_API_KEY or YC_IAM_TOKEN):
         return False
+    # При Api-Key обычно нужен folderId
     if YC_API_KEY and not YC_FOLDER_ID:
         return False
     return True
@@ -208,9 +250,11 @@ def _cache_put(src: str, tgt: str, text: str, translated: str) -> None:
 async def translate_to_ru(text: str, source_lang: str = "en") -> str:
     if not text:
         return text
+
     cached = _cache_get(source_lang, "ru", text)
     if cached is not None:
         return cached
+
     if not _yc_ready():
         return text
 
@@ -246,94 +290,276 @@ async def translate_to_ru(text: str, source_lang: str = "en") -> str:
         return text
 
 
-# ===================== MEME CAPTION (если используешь) =====================
+# ===================== MEMES (картинка с РУССКИМ текстом на изображении) =====================
 
-ROLE_PREFIX = {
-    "developer": [
-        "🤷 Я ничего не трогал",
-        "✅ У меня работает",
-        "✨ Это фича",
-        "🛠 Сейчас быстро поправлю",
-        "📦 Просто обновил зависимости",
-    ],
-    "tester": [
-        "🐛 Баг не воспроизводится",
-        "🔎 Нашёл ещё один сценарий",
-        "🧾 Шаги воспроизведения прилагаю",
-        "💥 Оно сломано",
-        "⚠️ Проверил на проде",
-    ],
-    "support": [
-        "📨 Передал разработчикам",
-        "🧯 Уже разбираемся",
-        "🙏 Пользователь очень просит",
-        "⏳ Исправим в следующем релизе",
-        "💬 Спасибо за обращение",
-    ],
-    "common": [
-        "😑 Ну началось",
-        "🙃 Опять это",
-        "📌 Классика",
-        "🧩 Всё по плану",
-        "🧱 Стабильно",
-    ],
-}
-
-PUNCHLINES = [
-    "— это заняло 5 минут",
-    "— и никто не заметит",
-    "— в пятницу вечером",
-    "— после одного маленького изменения",
-    "— зато теперь быстрее",
-    "— само починилось",
-    "— а я предупреждал",
-    "— не трогай, работает",
+# По умолчанию сначала делаем RU-текст НА КАРТИНКЕ (memegen),
+# дальше идут запасные источники (могут давать англ. текст на картинке).
+FUN_MEME_PROVIDERS = [
+    p.strip().lower()
+    for p in os.getenv("FUN_MEME_PROVIDERS", "memegen,apileague,memeapi,imgflip").split(",")
+    if p.strip()
 ]
 
-WORK_CONTEXT = [
-    "Jira в проде",
-    "после деплоя",
-    "после рефакторинга",
-    "когда горит дедлайн",
-    "когда менеджер онлайн",
-    "когда ушёл на обед",
-    "когда закрыл задачу",
-    "когда открыл базу в DBeaver",
+APILEAGUE_API_KEY = (os.getenv("APILEAGUE_API_KEY") or "").strip()
+
+# Безопасность/качество
+FUN_MEME_SAFE_MODE = os.getenv("FUN_MEME_SAFE_MODE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+FUN_MEME_TITLE_MAX = int(os.getenv("FUN_MEME_TITLE_MAX", "220"))
+FUN_MEME_TIMEOUT = float(os.getenv("FUN_MEME_TIMEOUT", "8.0"))
+
+# Чтобы не слать один и тот же мем подряд
+_meme_seen: "OrderedDict[str, str]" = OrderedDict()
+MEME_SEEN_MAX = int(os.getenv("MEME_SEEN_MAX", "50"))
+
+# Пулы русских мем-фраз (верх/низ). Можно расширять.
+RU_MEME_LINES = [
+    ("Я: сейчас быстро поправлю", "Прод: а давай ещё одну правку"),
+    ("Пишу «маленький фикс»", "Потом 3 часа деплою"),
+    ("Всё работает на моей машине", "Значит, проблема у Вселенной"),
+    ("Сделал рефакторинг", "Сломал то, что не трогал"),
+    ("Дедлайн завтра", "Паника сегодня"),
+    ("Стендап через 5 минут", "Я впервые вижу этот тикет"),
+    ("Тесты зелёные", "Но почему-то прод горит"),
+    ("Баг «не воспроизводится»", "Пользователь: «у меня воспроизводится»"),
+    ("Сейчас быстро зарелижу", "CI: держи 17 ошибок"),
+    ("ПМ: это на 5 минут", "Я: это на 2 дня"),
+]
+
+# Шаблоны memegen.link (обеспечивают текст на картинке).
+MEMEGEN_TEMPLATES = [
+    "buzz",
+    "drake",
+    "distractedbf",
+    "two_buttons",
+    "success",
+    "sad-biden",
+    "fry",
+    "doge",
 ]
 
 
-def generate_caption(role: str, meme_title: str) -> str:
-    role = role if role in ROLE_PREFIX else "common"
-    prefix = random.choice(ROLE_PREFIX[role])
-    context = random.choice(WORK_CONTEXT)
-    punch = random.choice(PUNCHLINES)
-    _ = meme_title
-    return f"{prefix}\n\n{context}\n{punch}"
+def _clip_caption(s: str, max_len: int = 220) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max(0, max_len - 1)].rstrip() + "…"
+
+
+def _remember_meme(url: str) -> None:
+    if not url:
+        return
+    _meme_seen[url] = datetime.utcnow().isoformat()
+    while len(_meme_seen) > MEME_SEEN_MAX:
+        try:
+            _meme_seen.pop(next(iter(_meme_seen)))
+        except Exception:
+            break
+
+
+def _already_seen(url: str) -> bool:
+    return bool(url) and url in _meme_seen
+
+
+def _memegen_escape(text: str) -> str:
+    # memegen принимает текст в URL. Кодируем UTF-8.
+    # Пустые строки — "_" (у memegen это “пусто”).
+    t = (text or "").strip()
+    if not t:
+        return "_"
+    return quote(t, safe="")
+
+
+async def _url_seems_reachable(url: str) -> bool:
+    """
+    Быстрая проверка: удаётся ли достучаться до URL (учитывая возможные блокировки/таймауты).
+    HEAD иногда режут, поэтому fallback на GET с Range.
+    """
+    if not url:
+        return False
+
+    client = await get_http_client()
+
+    try:
+        r = await client.head(url, timeout=FUN_MEME_TIMEOUT)
+        if 200 <= r.status_code < 400:
+            return True
+    except Exception:
+        pass
+
+    try:
+        r = await client.get(
+            url,
+            headers={"Range": "bytes=0-0"},
+            timeout=FUN_MEME_TIMEOUT,
+        )
+        if 200 <= r.status_code < 400:
+            return True
+    except Exception:
+        return False
+
+    return False
+
+
+async def _meme_from_memegen_ru() -> Optional[Tuple[str, str]]:
+    """
+    Гарантирует РУССКИЙ текст НА КАРТИНКЕ через memegen.link (URL-based rendering).
+    """
+    top, bottom = random.choice(RU_MEME_LINES)
+    template = random.choice(MEMEGEN_TEMPLATES)
+
+    top_e = _memegen_escape(top)
+    bottom_e = _memegen_escape(bottom)
+
+    # png — самый совместимый вариант для Telegram sendPhoto
+    img_url = f"https://api.memegen.link/images/{template}/{top_e}/{bottom_e}.png"
+    caption = "🤣 Мем"
+    return caption, img_url
+
+
+async def _meme_from_apileague() -> Optional[Tuple[str, str]]:
+    """
+    API League Random Meme API.
+    НЕ гарантирует русский текст на картинке (это фоллбек).
+    """
+    if not APILEAGUE_API_KEY:
+        return None
+
+    url = os.getenv("FUN_APILEAGUE_URL", "https://api.apileague.com/retrieve-random-meme")
+    params = {"api-key": APILEAGUE_API_KEY}
+
+    data = await _fetch_json(url, params=params, timeout=FUN_MEME_TIMEOUT)
+    if not data:
+        return None
+
+    img = (data.get("url") or data.get("image") or data.get("imageUrl") or "").strip()
+    title = (data.get("title") or data.get("caption") or data.get("name") or "").strip()
+
+    if FUN_MEME_SAFE_MODE:
+        nsfw = data.get("nsfw")
+        if isinstance(nsfw, bool) and nsfw:
+            return None
+
+    if not img:
+        return None
+
+    title = _clip_caption(title, FUN_MEME_TITLE_MAX) or "🖼️ Мем дня"
+    return title, img
+
+
+async def _meme_from_memeapi() -> Optional[Tuple[str, str]]:
+    """
+    meme-api.com (reddit-агрегатор).
+    НЕ гарантирует русский текст на картинке (это фоллбек).
+    """
+    endpoint = os.getenv("FUN_MEMEAPI_URL", "https://meme-api.com/gimme/wholesomememes")
+    data = await _fetch_json(endpoint, timeout=FUN_MEME_TIMEOUT)
+    if not data:
+        return None
+
+    img = (data.get("url") or "").strip()
+    title = (data.get("title") or "").strip()
+
+    if FUN_MEME_SAFE_MODE:
+        if data.get("nsfw") is True or data.get("spoiler") is True:
+            return None
+
+    if not img:
+        return None
+
+    title = _clip_caption(title, FUN_MEME_TITLE_MAX) or "🖼️ Мем дня"
+    return title, img
+
+
+async def _meme_from_imgflip_templates() -> Optional[Tuple[str, str]]:
+    """
+    Фоллбек: Imgflip get_memes — это скорее шаблоны, но хотя бы картинка + название.
+    НЕ гарантирует русский текст на картинке (это фоллбек).
+    """
+    data = await _fetch_json("https://api.imgflip.com/get_memes", timeout=FUN_MEME_TIMEOUT)
+    memes = (data or {}).get("data", {}).get("memes", []) if data else []
+    if not memes:
+        return None
+
+    for _ in range(10):
+        meme = random.choice(memes)
+        img = (meme.get("url") or "").strip()
+        title = (meme.get("name") or "🖼️ Мем").strip()
+        if not img or _already_seen(img):
+            continue
+        return _clip_caption(title, FUN_MEME_TITLE_MAX), img
+
+    meme = random.choice(memes)
+    img = (meme.get("url") or "").strip()
+    title = (meme.get("name") or "🖼️ Мем").strip()
+    if not img:
+        return None
+    return _clip_caption(title, FUN_MEME_TITLE_MAX), img
 
 
 async def get_random_meme(role: str = "common") -> Tuple[str, Optional[str]]:
-    try:
-        data = await _fetch_json("https://api.imgflip.com/get_memes")
-        memes = (data or {}).get("data", {}).get("memes", []) if data else []
-        if not memes:
-            return "Сегодня без мемов — всё слишком стабильно.", None
-        meme = random.choice(memes)
-        caption = generate_caption(role, meme.get("name", ""))
-        return caption, meme.get("url")
-    except Exception as e:
-        logger.error(f"Ошибка получения мема: {e}")
-        return "Мемы закончились. Возможно, их зарефакторили.", None
+    """
+    Возвращает (caption, image_url).
+
+    ВАЖНО:
+    - Если FUN_MEME_PROVIDERS начинается с "memegen", то мемы будут с РУССКИМ текстом НА КАРТИНКЕ.
+    - Остальные провайдеры — фоллбеки, язык на картинке не гарантируют.
+    """
+    _ = role  # роль оставлена для совместимости
+    providers = FUN_MEME_PROVIDERS or ["memegen", "apileague", "memeapi", "imgflip"]
+
+    for prov in providers:
+        try:
+            if prov == "memegen":
+                item = await _meme_from_memegen_ru()
+            elif prov == "apileague":
+                item = await _meme_from_apileague()
+            elif prov == "memeapi":
+                item = await _meme_from_memeapi()
+            elif prov == "imgflip":
+                item = await _meme_from_imgflip_templates()
+            else:
+                continue
+
+            if not item:
+                continue
+
+            caption, img_url = item
+            if not img_url or _already_seen(img_url):
+                continue
+
+            if not await _url_seems_reachable(img_url):
+                logger.warning("Meme image URL not reachable (maybe blocked): %s", img_url)
+                continue
+
+            _remember_meme(img_url)
+            # caption для телеги оставляем коротким (сам текст — на картинке)
+            return _clip_caption(caption, FUN_MEME_TITLE_MAX) or "🤣 Мем", img_url
+
+        except Exception as e:
+            logger.warning("Meme provider failed (%s): %s", prov, e)
+
+    return "Сегодня без мемов — всё слишком стабильно.", None
 
 
 # ===================== HOROSCOPE =====================
 
-_DATE_RANGE_RE = re.compile(r"\b\d{1,2}\s+[а-яё]+\s*-\s*\d{1,2}\s+[а-яё]+\b", re.IGNORECASE)
+_DATE_RANGE_RE = re.compile(
+    r"\b\d{1,2}\s+[а-яё]+\s*-\s*\d{1,2}\s+[а-яё]+\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_mailru_horoscope(text: str, sign_ru: str) -> str:
     """
-    Достаём прогноз именно для sign_ru (например "Дева"),
-    а не список всех знаков (меню).
+    Достаём прогноз именно для sign_ru (например "Дева"), а не список всех знаков (меню).
     """
     if not text:
         return ""
@@ -363,19 +589,13 @@ def _parse_mailru_horoscope(text: str, sign_ru: str) -> str:
     for i in range(sign_idx + 1, len(lines)):
         l = lines[i]
 
-        # пропускаем диапазон дат
         if _DATE_RANGE_RE.search(l):
             continue
-
-        # пропускаем названия знаков (меню)
         if l.lower() in ZODIAC_MAP.keys():
             continue
-
-        # иногда попадаются короткие подписи "Сегодня", "Общий" и т.п.
         if len(l) < 40:
             continue
 
-        # прогноз обычно похож на текст с точками/запятыми
         if "." in l or "!" in l or "?" in l:
             start = i
             break
@@ -383,7 +603,7 @@ def _parse_mailru_horoscope(text: str, sign_ru: str) -> str:
     if start is None:
         return ""
 
-    # 3) Конец — перед "Финансы/Здоровье/Любовь" (встречается почти всегда)
+    # 3) Конец — перед "Финансы/Здоровье/Любовь"
     end = len(lines)
     for i in range(start, len(lines)):
         if lines[i].strip().lower() in ("финансы", "здоровье", "любовь"):
@@ -392,11 +612,9 @@ def _parse_mailru_horoscope(text: str, sign_ru: str) -> str:
 
     forecast_lines = lines[start:end]
 
-    # выкинем случайные мусорные короткие строки
     cleaned = [x for x in forecast_lines if len(x) >= 25]
-
-    # обычно прогноз — 1–3 абзаца; ограничим, чтобы не простыня
     cleaned = cleaned[:3]
+
     return "\n\n".join(cleaned).strip()
 
 
@@ -458,6 +676,7 @@ def _parse_randstuff_fact(text: str) -> str:
         if line.lower() in ("факт:", "# факт:", "факт"):
             if i + 1 < len(lines):
                 return lines[i + 1]
+
     return ""
 
 
