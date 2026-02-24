@@ -85,12 +85,12 @@ SETUP_JIRA_USER, SETUP_JIRA_TOKEN, ADD_FILTER_NAME, ADD_FILTER_JQL = range(4)
 # ---------------------------
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Постоянные кнопки внизу бота (ReplyKeyboardMarkup).
-    """
     keyboard = [
-        [KeyboardButton("Настройки"), KeyboardButton("Фильтры")],
-        [KeyboardButton("Блокирующие задачи")],
+        [KeyboardButton("🏠 Дашборд"), KeyboardButton("⚙️ Настройки")],
+        [KeyboardButton("🔎 Фильтры"), KeyboardButton("🔔 Уведомления")],
+        [KeyboardButton("👋 Упоминания"), KeyboardButton("🚧 Блокирующие")],
+        [KeyboardButton("📊 Статус"), KeyboardButton("🧾 Дайджест")],
+        [KeyboardButton("🎲 Fun"), KeyboardButton("❓ Help")],
     ]
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
@@ -1452,19 +1452,83 @@ async def handle_pending_command(update: Update, context: ContextTypes.DEFAULT_T
             await send_message_safe(context.application, update.effective_user.id, f"Команда /{cmd} не найдена.", reply_markup=main_reply_keyboard())
         return
 
-    # 2) нижнее меню
-    t = update.message.text.strip().lower()
-    if t == "настройки":
+        # 2) нижнее меню
+    t = update.message.text.strip()
+
+    if t == "🏠 Дашборд":
+        await render_dashboard(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Выбери раздел:",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if t == "⚙️ Настройки":
         await render_settings_screen(update, context)
-        await ensure_main_keyboard(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Настройки:",
+            reply_markup=main_reply_keyboard(),
+        )
         return
-    if t == "фильтры":
+
+    if t == "🔎 Фильтры":
         await render_filters_screen(update, context)
-        await ensure_main_keyboard(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Фильтры:",
+            reply_markup=main_reply_keyboard(),
+        )
         return
-    if t == "блокирующие задачи":
+
+    if t == "🔔 Уведомления":
+        await render_notifications_screen(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Уведомления:",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if t == "👋 Упоминания":
+        await render_mentions_screen(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Упоминания:",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if t == "🚧 Блокирующие":
         await render_blockers_screen(update, context)
-        await ensure_main_keyboard(update, context)
+        await send_message_safe(
+            context.application,
+            update.effective_user.id,
+            "Блокирующие задачи:",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if t == "📊 Статус":
+        await status_cmd(update, context)
+        return
+
+    if t == "🧾 Дайджест":
+        await digest_cmd(update, context)
+        return
+
+    if t == "❓ Help":
+        await help_cmd(update, context)
+        return
+
+    if t == "🎲 Fun":
+        await profile_cmd(update, context)
         return
 
     # Иначе — подсказка
