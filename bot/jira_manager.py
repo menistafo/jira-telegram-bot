@@ -3,7 +3,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
 from .jira_client import JiraClient, JiraAuthError
 
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class JiraManagerConfig:
     """Параметры, влияющие на стабильность и нагрузку на Jira."""
-
     max_concurrency: int = 5          # общий предел параллельных запросов в Jira на процесс
     max_clients: int = 200            # ограничение количества клиентов в памяти (LRU)
     client_ttl_seconds: int = 3600    # время жизни клиента без активности (опционально)
@@ -24,32 +23,38 @@ class JiraManager:
 
     В исходной версии клиенты лежали в dict без лимитов и без синхронизации.
     Здесь:
-      - LRU на клиентов (чтобы не течь памятью),
-      - общий семафор на все запросы (чтобы не DDOS'ить Jira),
-      - безопасное пересоздание клиента после 401/403.
+    - LRU на клиентов (чтобы не течь памятью),
+    - общий семафор на все запросы (чтобы не DDOS'ить Jira),
+    - безопасное пересоздание клиента после 401/403.
     """
 
     def __init__(self, config: Optional[JiraManagerConfig] = None):
         self.config = config or JiraManagerConfig()
+
         # Важно: max_concurrency и max_clients можно переопределять env'ами, но не тащим config.py сюда.
-        self.config.max_concurrency = int(
-            __import__("os").getenv("JIRA_MAX_CONCURRENCY", str(self.config.max_concurrency))
-        )
-        self.config.max_clients = int(
-            __import__("os").getenv("JIRA_CLIENTS_MAX", str(self.config.max_clients))
-        )
+        import os
+        self.config.max_concurrency = int(os.getenv("JIRA_MAX_CONCURRENCY", str(self.config.max_concurrency)))
+        self.config.max_clients = int(os.getenv("JIRA_CLIENTS_MAX", str(self.config.max_clients)))
+
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
 
         # OrderedDict даёт LRU: последний использованный в конце.
         self._user_clients: "OrderedDict[int, JiraClient]" = OrderedDict()
         self._lock = asyncio.Lock()
+
         logger.info(
             "✅ JiraManager initialized (max_concurrency=%s, max_clients=%s)",
             self.config.max_concurrency,
             self.config.max_clients,
         )
 
-    async def create_client(self, user_id: int, jira_user: str, jira_token: str, base_url: Optional[str] = None) -> JiraClient:
+    async def create_client(
+        self,
+        user_id: int,
+        jira_user: str,
+        jira_token: str,
+        base_url: Optional[str] = None,
+    ) -> JiraClient:
         """Создаёт/заменяет клиента для пользователя."""
         async with self._lock:
             client = JiraClient(
@@ -58,6 +63,7 @@ class JiraManager:
                 token=jira_token,
                 semaphore=self._semaphore,
             )
+
             # При замене — закрываем старый клиент, чтобы не утекали соединения
             old = self._user_clients.pop(user_id, None)
             if old:
@@ -68,6 +74,7 @@ class JiraManager:
 
             self._user_clients[user_id] = client
             self._user_clients.move_to_end(user_id)
+
             await self._evict_if_needed()
             return client
 
@@ -88,6 +95,14 @@ class JiraManager:
                     await client.aclose()
                 except Exception:
                     logger.exception("Failed to close JiraClient for user_id=%s", user_id)
+
+    async def remove_client(self, user_id: int) -> None:
+        """Backward-compatible alias.
+
+        В коде раньше использовался remove_client(), теперь основной метод — invalidate_client().
+        Оставляем алиас, чтобы не ловить AttributeError в старых местах.
+        """
+        await self.invalidate_client(user_id)
 
     async def get_or_create_client(
         self,
@@ -111,6 +126,7 @@ class JiraManager:
         async with self._lock:
             clients = list(self._user_clients.values())
             self._user_clients.clear()
+
         for c in clients:
             try:
                 await c.aclose()
