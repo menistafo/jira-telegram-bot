@@ -12,6 +12,7 @@ services:
       - ADMIN_USER_IDS=${ADMIN_USER_IDS}
       - DATABASE_PATH=/app/data/jira_bot.db
       - DEBUG=${DEBUG:-false}
+      - JIRA_AUTH_MODE=bearer
     volumes:
       # Монтируем папку data из хоста в контейнер
       - ./data:/app/data
