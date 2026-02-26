@@ -13,12 +13,12 @@ import sqlite3
 logger = logging.getLogger(__name__)
 
 
-
 class _IdentityCipher:
     """Cipher stub used when encryption is disabled (mostly for tests).
 
     Provides Fernet-like interface: encrypt()/decrypt() accept/return bytes.
     """
+
     def encrypt(self, data: bytes) -> bytes:  # noqa: D401
         return data
 
@@ -30,41 +30,32 @@ def _is_truthy_env(name: str) -> bool:
     return (os.getenv(name, "").strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
-
-# Текущая версия схемы базы данных (увеличена до 6)
+# Текущая версия схемы базы данных
 SCHEMA_VERSION = 8
+
 
 class Database:
     def __init__(self, db_path: str = None, encryption_key: Optional[bytes] = None):
         if db_path is None:
             db_path = os.getenv("DATABASE_PATH", "/app/bot/data/jira_bot.db")
-        
+
         self.db_path = os.path.abspath(db_path)
         logger.info(f"📂 Database path: {self.db_path}")
-        
+
         data_dir = os.path.dirname(self.db_path)
         os.makedirs(data_dir, exist_ok=True)
-        
+
         backup_dir = os.path.join(data_dir, "backups")
         os.makedirs(backup_dir, exist_ok=True)
-        
+
         try:
             os.chmod(data_dir, 0o750)
             os.chmod(backup_dir, 0o750)
         except Exception as e:
             logger.warning(f"⚠️ Could not set permissions: {e}")
-        
-        
+
         # -------------------------------------------------------------------
         # Encryption / Fernet
-        #
-        # IMPORTANT:
-        # - In production we use cryptography.fernet.Fernet to encrypt tokens.
-        # - In tests (especially on Windows / Python 3.13+ / 3.14+) you may
-        #   encounter issues with old 'cryptography' wheels (PyO3 mismatch).
-        #   To keep tests runnable, encryption can be disabled via env:
-        #       BOT_DISABLE_ENCRYPTION=1
-        #   In that mode we use _IdentityCipher (no-op).
         # -------------------------------------------------------------------
         disable_encryption = _is_truthy_env("BOT_DISABLE_ENCRYPTION")
         if disable_encryption:
@@ -74,7 +65,6 @@ class Database:
             try:
                 from cryptography.fernet import Fernet  # type: ignore
             except Exception as e:
-                # Fail fast with a clear message in production runs.
                 raise ImportError(
                     "cryptography is required for encryption but failed to import. "
                     "Install/upgrade 'cryptography' or set BOT_DISABLE_ENCRYPTION=1 for tests."
@@ -99,23 +89,19 @@ class Database:
                         pass
                     logger.info(f"🔑 Generated new encryption key and saved to: {key_path}")
                 self.cipher = Fernet(key)
-        
+
         self._lock = asyncio.Lock()
         self._conn: Optional[aiosqlite.Connection] = None
 
         # Поведение при проблемах ФС/volume (часто в Docker):
-        # WAL иногда падает на некоторых storage / при правах на каталог.
-        # Если нужно принудительно отключить WAL — выставь SQLITE_JOURNAL_MODE=DELETE.
         self._journal_mode = (os.getenv("SQLITE_JOURNAL_MODE", "WAL") or "WAL").strip().upper()
         self._max_retry = int(os.getenv("SQLITE_MAX_RETRY", "5"))
         self._base_retry_delay = float(os.getenv("SQLITE_RETRY_DELAY", "0.25"))
-        # Сколько ждать блокировку (database is locked). Если базу открывали внешним клиентом
-        # (DBeaver/SQLiteStudio) и он держит транзакцию — бот будет терпеливо ждать.
         self._busy_timeout_ms = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "15000"))
-    
+
     async def _get_conn(self) -> aiosqlite.Connection:
         if self._conn is None:
-            # Быстрый sanity-check на права записи в каталог базы
+            # sanity-check на запись в каталог базы
             try:
                 test_path = os.path.join(os.path.dirname(self.db_path), ".db_write_test")
                 with open(test_path, "w", encoding="utf-8") as f:
@@ -134,19 +120,19 @@ class Database:
                 check_same_thread=False
             )
             self._conn.row_factory = aiosqlite.Row
-            # Настраиваем PRAGMA. WAL по умолчанию, но можно переопределить env.
+
             await self._conn.execute(f"PRAGMA journal_mode={self._journal_mode};")
             await self._conn.execute("PRAGMA synchronous=NORMAL;")
             await self._conn.execute("PRAGMA foreign_keys=ON;")
             await self._conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms};")
-            # Чуть более стабильное поведение на некоторых volume/FS
             await self._conn.execute("PRAGMA temp_store=MEMORY;")
             await self._conn.execute("PRAGMA wal_autocheckpoint=1000;")
+
             await self._initialize_schema()
         return self._conn
 
     async def _reset_conn(self):
-        """Закрыть и сбросить соединение (используем для recovery после disk I/O)."""
+        """Закрыть и сбросить соединение (recovery после disk I/O)."""
         try:
             if self._conn is not None:
                 await self._conn.close()
@@ -156,8 +142,6 @@ class Database:
 
     def _is_transient_sqlite_error(self, e: Exception) -> bool:
         msg = str(e).lower()
-        # "disk I/O error" часто возникает при проблемах с volume/permissions/FS.
-        # "database is locked" и "busy" — тоже временные.
         return any(
             s in msg
             for s in (
@@ -171,11 +155,7 @@ class Database:
         )
 
     async def _execute_with_retry(self, sql: str, params: tuple = (), *, commit: bool = False):
-        """Выполнить запрос с ретраями и recovery на проблемах ФС/lock.
-
-        Важно: это не лечит переполненный диск/битый volume, но позволяет пережить
-        кратковременные ошибки и пересоздать соединение, если SQLite/WAL упал.
-        """
+        """Выполнить запрос с ретраями и recovery на проблемах ФС/lock."""
         last_err: Optional[Exception] = None
         for attempt in range(1, self._max_retry + 1):
             try:
@@ -193,7 +173,6 @@ class Database:
                     f"⚠️ SQLite transient error on attempt {attempt}/{self._max_retry}: {e} | sql={sql[:80]}"
                 )
 
-                # Recovery: сбрасываем соединение на disk I/O и пытаемся снова.
                 try:
                     if "disk i/o" in str(e).lower() and self._journal_mode == "WAL":
                         logger.warning("⚠️ Switching SQLITE journal_mode from WAL to DELETE due to disk I/O")
@@ -205,12 +184,12 @@ class Database:
                 await asyncio.sleep(self._base_retry_delay * attempt)
 
         raise last_err  # type: ignore
-    
+
     async def close(self):
         if self._conn:
             await self._conn.close()
             self._conn = None
-    
+
     async def _initialize_schema(self):
         conn = await self._get_conn()
         async with self._lock:
@@ -218,7 +197,7 @@ class Database:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
             )
             table_exists = await cursor.fetchone()
-            
+
             if not table_exists:
                 logger.info("🆕 New database, creating tables...")
                 await self._create_all_tables(conn)
@@ -227,7 +206,7 @@ class Database:
             else:
                 current_version = await self._get_schema_version(conn)
                 logger.info(f"📊 Current database schema version: {current_version}")
-                
+
                 if current_version < SCHEMA_VERSION:
                     logger.info(f"🔄 Upgrading schema from v{current_version} to v{SCHEMA_VERSION}...")
                     await self._migrate(current_version, conn)
@@ -235,9 +214,9 @@ class Database:
                     logger.info(f"✅ Schema upgraded to version {SCHEMA_VERSION}")
                 else:
                     logger.info(f"✅ Schema is up to date (version {current_version})")
-            
+
             await self._ensure_columns(conn)
-    
+
     async def _ensure_columns(self, conn: aiosqlite.Connection):
         required_columns = {
             'sessions': ['session_id', 'user_id', 'step', 'data', 'created_at', 'expires_at'],
@@ -252,7 +231,7 @@ class Database:
         for table, columns in required_columns.items():
             cursor = await conn.execute(f"PRAGMA table_info({table})")
             existing = {row[1] for row in await cursor.fetchall()}
-            
+
             for col in columns:
                 if col not in existing:
                     if col in ('id', 'user_id', 'message_id', 'notification_sent', 'is_reminder', 'is_active', 'check_interval', 'retention_days', 'xp', 'level', 'streak', 'whisper_enabled', 'notifications_muted'):
@@ -274,10 +253,10 @@ class Database:
                     if col == 'id':
                         continue
                     # NOTE: Не удаляем лишние колонки автоматически.
-                    # SQLite поддерживает DROP COLUMN только в новых версиях, а в Docker/CI это часто ломается.
-                    # Если нужно — делай миграцию с пересозданием таблицы.
+                    pass
+
         await conn.commit()
-    
+
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         try:
             cursor = await conn.execute("SELECT version FROM schema_version LIMIT 1")
@@ -285,19 +264,19 @@ class Database:
             return row["version"] if row else 0
         except aiosqlite.OperationalError:
             return 0
-    
+
     async def _set_schema_version(self, version: int, conn: aiosqlite.Connection):
         await conn.execute("DELETE FROM schema_version")
         await conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
         await conn.commit()
-    
+
     async def _create_all_tables(self, conn: aiosqlite.Connection):
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             )
         """)
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -313,8 +292,8 @@ class Database:
             last_auth_error_time TEXT,
 
             -- Fun / UX
-            fun_mode TEXT DEFAULT 'off',              -- off | light | full
-            personality TEXT DEFAULT 'neutral',       -- neutral | developer | tester | support
+            fun_mode TEXT DEFAULT 'off',
+            personality TEXT DEFAULT 'neutral',
             zodiac TEXT,
             xp INTEGER DEFAULT 0,
             level INTEGER DEFAULT 1,
@@ -329,7 +308,7 @@ class Database:
             notifications_muted INTEGER DEFAULT 0
         )
 ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -341,7 +320,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS user_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -358,7 +337,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -376,7 +355,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS muted_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,7 +367,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS issue_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -401,7 +380,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS user_mentions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,10 +396,10 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-        
+
         await self._create_indexes(conn)
         await conn.commit()
-    
+
     async def _create_indexes(self, conn: aiosqlite.Connection):
         indexes = [
             ('idx_users_user_id', 'users', 'user_id'),
@@ -439,30 +418,30 @@ class Database:
             ('idx_user_mentions_notification', 'user_mentions', 'user_id, notification_sent'),
             ('idx_user_mentions_issue', 'user_mentions', 'issue_key'),
         ]
-        
+
         for idx_name, table, columns in indexes:
             try:
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}({columns})")
             except Exception as e:
                 logger.error(f"Error creating index {idx_name}: {e}")
-        
+
         try:
             await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_unique 
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_unique
                 ON user_mentions(user_id, issue_key, mention_hash)
             """)
         except Exception as e:
             logger.error(f"Error creating unique index idx_user_mentions_unique: {e}")
-        
+
         try:
             await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_comment 
-                ON user_mentions(user_id, issue_key, comment_id) 
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_comment
+                ON user_mentions(user_id, issue_key, comment_id)
                 WHERE comment_id IS NOT NULL
             """)
         except Exception as e:
             logger.error(f"Error creating unique index idx_user_mentions_comment: {e}")
-    
+
     async def _migrate(self, from_version: int, conn: aiosqlite.Connection):
         if from_version < 2:
             logger.info("Running migration from v1 to v2: adding missing columns")
@@ -483,11 +462,11 @@ class Database:
                     ('retention_days', 'INTEGER DEFAULT 30'),
                 ]
             }
-            
+
             for table, columns in tables_to_update.items():
                 cursor = await conn.execute(f"PRAGMA table_info({table})")
                 existing = {row[1] for row in await cursor.fetchall()}
-                
+
                 for col_name, col_type in columns:
                     if col_name not in existing:
                         logger.info(f"   Adding column {col_name} to {table}")
@@ -496,7 +475,7 @@ class Database:
                         except aiosqlite.OperationalError as e:
                             if "duplicate column name" not in str(e):
                                 raise
-            
+
             cursor = await conn.execute("PRAGMA table_info(sessions)")
             existing_sessions = {row[1] for row in await cursor.fetchall()}
             if 'expires_at' not in existing_sessions:
@@ -511,7 +490,7 @@ class Database:
 
             await conn.commit()
             logger.info("Migration to v2 completed")
-        
+
         if from_version < 3:
             logger.info("Running migration from v2 to v3: adding unique index on user_mentions")
             try:
@@ -524,7 +503,7 @@ class Database:
                     )
                 """)
                 await conn.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_unique 
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_mentions_unique
                     ON user_mentions(user_id, issue_key, mention_hash)
                 """)
                 await conn.commit()
@@ -570,7 +549,7 @@ class Database:
                 await conn.commit()
             except Exception as e:
                 logger.error(f"Failed to add last_auth_error_time column: {e}")
-    
+
         if from_version < 8:
             logger.info("Running migration to v8: adding notifications_muted to users")
             try:
@@ -584,14 +563,13 @@ class Database:
             except Exception as e:
                 logger.error(f"Failed to add notifications_muted column: {e}")
 
-
     # ------------------- Шифрование -------------------
     def _encrypt(self, data: str) -> str:
         if not data:
             return ""
         encrypted = self.cipher.encrypt(data.encode())
         return encrypted.decode()
-    
+
     def _decrypt(self, data: str) -> str:
         if not data:
             return ""
@@ -601,81 +579,86 @@ class Database:
         except Exception as e:
             logger.error(f"Error decrypting data: {e}")
             return ""
-    
+
     # ------------------- Методы пользователей -------------------
-    async def get_or_create_user(self, user_id: int, username: str = None,
-                                first_name: str = None, last_name: str = None,
-                                chat_id: int = None) -> Dict[str, Any]:
+    async def get_or_create_user(
+        self,
+        user_id: int,
+        username: str = None,
+        first_name: str = None,
+        last_name: str = None,
+        chat_id: int = None
+    ) -> Dict[str, Any]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         user = await cursor.fetchone()
-        
+
         now = datetime.now().isoformat()
-        
+
         if user:
             update_fields = []
             update_values = []
-            
+
             if username and username != user["username"]:
                 update_fields.append("username = ?")
                 update_values.append(username)
-            
+
             if first_name and first_name != user["first_name"]:
                 update_fields.append("first_name = ?")
                 update_values.append(first_name)
-            
+
             if last_name and last_name != user["last_name"]:
                 update_fields.append("last_name = ?")
                 update_values.append(last_name)
-            
+
             if chat_id and chat_id != user["chat_id"]:
                 update_fields.append("chat_id = ?")
                 update_values.append(chat_id)
-            
+
             if update_fields:
                 update_fields.append("updated_at = ?")
                 update_values.append(now)
                 update_values.append(user_id)
-                
+
                 await conn.execute(
                     f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?",
                     update_values
                 )
                 await conn.commit()
-            
+
             cursor = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             user = await cursor.fetchone()
-            
+
             result = dict(user)
             if result.get("jira_token"):
                 result["jira_token"] = self._decrypt(result["jira_token"])
             return result
-        else:
-            await conn.execute(
-                """INSERT INTO users 
-                   (user_id, username, first_name, last_name, chat_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, username, first_name, last_name, chat_id, now, now)
-            )
-            await conn.commit()
-            logger.info(f"👤 Created new user: {user_id} ({username})")
-            return {
-                "user_id": user_id,
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-                "chat_id": chat_id,
-                "jira_user": None,
-                "jira_token": None,
-                "last_mention_check": None,
-                "work_start_time": None,
-                "last_cleanup_date": None,
-                "last_auth_error_time": None,
-                "created_at": now,
-                "updated_at": now,
-                "is_active": 1
-            }
-    
+
+        await conn.execute(
+            """INSERT INTO users
+               (user_id, username, first_name, last_name, chat_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, username, first_name, last_name, chat_id, now, now)
+        )
+        await conn.commit()
+        logger.info(f"👤 Created new user: {user_id} ({username})")
+        return {
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "chat_id": chat_id,
+            "jira_user": None,
+            "jira_token": None,
+            "last_mention_check": None,
+            "work_start_time": None,
+            "last_cleanup_date": None,
+            "last_auth_error_time": None,
+            "created_at": now,
+            "updated_at": now,
+            "is_active": 1
+        }
+
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -686,7 +669,7 @@ class Database:
                 result["jira_token"] = self._decrypt(result["jira_token"])
             return result
         return None
-    
+
     async def update_user_jira_credentials(self, user_id: int, jira_user: str, jira_token: str) -> bool:
         now = datetime.now().isoformat()
         encrypted_token = self._encrypt(jira_token) if jira_token else None
@@ -698,22 +681,31 @@ class Database:
         await conn.commit()
         logger.info(f"🔑 Updated Jira credentials for user {user_id}")
         return True
-    
+
     async def get_all_active_users(self) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM users WHERE is_active = 1 AND jira_user IS NOT NULL AND jira_token IS NOT NULL AND chat_id IS NOT NULL"
-        )
+
+        auth_mode = (os.getenv("JIRA_AUTH_MODE", "auto") or "auto").strip().lower()
+        if auth_mode == "bearer":
+            cursor = await conn.execute(
+                "SELECT * FROM users WHERE is_active = 1 AND jira_token IS NOT NULL AND chat_id IS NOT NULL"
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM users WHERE is_active = 1 AND jira_user IS NOT NULL AND jira_token IS NOT NULL AND chat_id IS NOT NULL"
+            )
+
         rows = await cursor.fetchall()
-        users = []
+        users: List[Dict[str, Any]] = []
         for row in rows:
             user = dict(row)
             if user.get("jira_token"):
                 user["jira_token"] = self._decrypt(user["jira_token"])
             users.append(user)
-        logger.info(f"👥 Found {len(users)} active users")
+
+        logger.info(f"👥 Found {len(users)} active users (auth_mode={auth_mode})")
         return users
-    
+
     async def deactivate_user(self, user_id: int) -> bool:
         conn = await self._get_conn()
         await conn.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
@@ -808,50 +800,50 @@ class Database:
             (user_id,)
         )
         filters = await cursor.fetchall()
-        
+
         today = datetime.now().date()
         deleted_total = 0
-        
+
         for f in filters:
             filter_name = f["filter_name"]
             days = f["days"]
             cutoff_date = (today - timedelta(days=days)).isoformat()
-            
+
             cursor = await conn.execute(
                 "DELETE FROM issue_history WHERE user_id = ? AND filter_name = ? AND created_at < ?",
                 (user_id, filter_name, cutoff_date)
             )
             deleted_total += cursor.rowcount
-            
+
             cursor = await conn.execute(
                 "DELETE FROM notifications WHERE user_id = ? AND filter_name = ? AND created_at < ?",
                 (user_id, filter_name, cutoff_date)
             )
             deleted_total += cursor.rowcount
-        
+
         await conn.commit()
         logger.info(f"🧹 Cleaned up {deleted_total} old records for user {user_id}")
         return deleted_total
 
     # ------------------- Методы сессий -------------------
     async def create_session(self, user_id: int, step: str, data: Dict = None,
-                            expires_in: int = 3600) -> str:
+                             expires_in: int = 3600) -> str:
         import uuid
         session_id = str(uuid.uuid4())
         now = datetime.now()
         expires_at = (now + timedelta(seconds=expires_in)).isoformat()
         data_json = json.dumps(data) if data else "{}"
-        
+
         conn = await self._get_conn()
         await conn.execute(
-            """INSERT INTO sessions 
+            """INSERT INTO sessions
                (session_id, user_id, step, data, created_at, expires_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (session_id, user_id, step, data_json, now.isoformat(), expires_at)
         )
         await conn.commit()
         return session_id
-    
+
     async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
@@ -868,7 +860,7 @@ class Database:
                 session["data"] = {}
             return session
         return None
-    
+
     async def update_session(self, session_id: str, step: str = None, data: Dict = None) -> bool:
         updates = []
         values = []
@@ -881,7 +873,7 @@ class Database:
         if not updates:
             return False
         values.append(session_id)
-        
+
         conn = await self._get_conn()
         await conn.execute(
             f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?",
@@ -889,13 +881,13 @@ class Database:
         )
         await conn.commit()
         return True
-    
+
     async def delete_session(self, session_id: str) -> bool:
         conn = await self._get_conn()
         cursor = await conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         await conn.commit()
         return cursor.rowcount > 0
-    
+
     async def cleanup_expired_sessions(self) -> int:
         now = datetime.now().isoformat()
         cursor = await self._execute_with_retry(
@@ -907,7 +899,7 @@ class Database:
         if deleted:
             logger.info(f"🗑 Cleaned up {deleted} expired sessions")
         return deleted
-    
+
     # ------------------- Методы фильтров -------------------
     async def add_user_filter(self, user_id: int, filter_name: str, jql: str,
                               check_interval: int = 5) -> bool:
@@ -915,7 +907,7 @@ class Database:
         conn = await self._get_conn()
         try:
             await conn.execute(
-                """INSERT INTO user_filters 
+                """INSERT INTO user_filters
                    (user_id, filter_name, jql, check_interval, retention_days, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (user_id, filter_name, jql, check_interval, 30, now, now)
@@ -926,7 +918,7 @@ class Database:
         except aiosqlite.IntegrityError:
             logger.warning(f"Filter '{filter_name}' already exists for user {user_id}")
             return False
-    
+
     async def get_user_filters(self, user_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         if active_only:
@@ -941,9 +933,9 @@ class Database:
             )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def get_user_filters_with_id(self, user_id: int, active_only: bool = True) -> List[Tuple[int, str, str]]:
-        """Вернуть фильтры в виде (id, filter_name, jql). Полезно для callback_data (лимит 64 байта)."""
+        """Вернуть фильтры в виде (id, filter_name, jql)."""
         conn = await self._get_conn()
         if active_only:
             cursor = await conn.execute(
@@ -960,7 +952,6 @@ class Database:
         return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
 
     async def get_filter_id_by_name(self, user_id: int, filter_name: str) -> Optional[int]:
-        """Найти id фильтра по имени (для формирования короткого callback_data)."""
         conn = await self._get_conn()
         cursor = await conn.execute(
             "SELECT id FROM user_filters WHERE user_id = ? AND filter_name = ? LIMIT 1",
@@ -973,7 +964,6 @@ class Database:
         return int(row[0])
 
     async def get_filter_name_by_id(self, user_id: int, filter_id: int) -> Optional[str]:
-        """Найти имя фильтра по id."""
         conn = await self._get_conn()
         cursor = await conn.execute(
             "SELECT filter_name FROM user_filters WHERE user_id = ? AND id = ? LIMIT 1",
@@ -996,7 +986,7 @@ class Database:
         if deleted:
             logger.info(f"🗑 Deleted filter '{filter_name}' for user {user_id}")
         return deleted
-    
+
     async def toggle_filter_active(self, user_id: int, filter_name: str, is_active: bool) -> bool:
         now = datetime.now().isoformat()
         conn = await self._get_conn()
@@ -1010,7 +1000,7 @@ class Database:
             status = "enabled" if is_active else "disabled"
             logger.info(f"🔧 Filter '{filter_name}' {status} for user {user_id}")
         return updated
-    
+
     async def update_filter_interval(self, user_id: int, filter_name: str, interval: int) -> bool:
         now = datetime.now().isoformat()
         conn = await self._get_conn()
@@ -1023,7 +1013,7 @@ class Database:
         if updated:
             logger.info(f"⏱️ Filter '{filter_name}' interval set to {interval} minutes for user {user_id}")
         return updated
-    
+
     async def update_filter_retention(self, user_id: int, filter_name: str, days: int) -> bool:
         now = datetime.now().isoformat()
         conn = await self._get_conn()
@@ -1036,7 +1026,7 @@ class Database:
         if updated:
             logger.info(f"♻️ Filter '{filter_name}' retention set to {days} days for user {user_id}")
         return updated
-    
+
     async def update_filter_jql(self, user_id: int, filter_name: str, new_jql: str) -> bool:
         now = datetime.now().isoformat()
         conn = await self._get_conn()
@@ -1049,7 +1039,7 @@ class Database:
         if updated:
             logger.info(f"✏️ JQL of filter '{filter_name}' updated for user {user_id}")
         return updated
-    
+
     async def get_filter(self, user_id: int, filter_name: str) -> Optional[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1058,11 +1048,9 @@ class Database:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
-    # ------------------- Методы истории задач -------------------
 
+    # ------------------- Методы истории задач -------------------
     async def get_filter_by_id(self, user_id: int, filter_id: int) -> Optional[Dict[str, Any]]:
-        """Получить фильтр по ID (безопасно для callback'ов)."""
         conn = await self._get_conn()
         cursor = await conn.execute(
             "SELECT * FROM user_filters WHERE user_id = ? AND id = ?",
@@ -1075,7 +1063,6 @@ class Database:
         return dict(zip(columns, row))
 
     async def is_notifications_muted(self, user_id: int) -> bool:
-        """True если пользователь отключил все уведомления (persisted в БД)."""
         conn = await self._get_conn()
         cursor = await conn.execute(
             "SELECT notifications_muted FROM users WHERE user_id = ?",
@@ -1087,7 +1074,6 @@ class Database:
         return bool(row[0])
 
     async def set_notifications_muted(self, user_id: int, muted: bool) -> None:
-        """Включает/выключает уведомления для пользователя (persisted)."""
         conn = await self._get_conn()
         await conn.execute(
             "UPDATE users SET notifications_muted = ?, updated_at = ? WHERE user_id = ?",
@@ -1102,7 +1088,7 @@ class Database:
         conn = await self._get_conn()
         try:
             await conn.execute(
-                """INSERT INTO issue_history 
+                """INSERT INTO issue_history
                    (user_id, filter_name, issue_key, issue_data, issue_hash, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (user_id, filter_name, issue_key, issue_data_json, issue_hash, now)
@@ -1112,11 +1098,11 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Error saving issue state: {e}")
             return False
-    
+
     async def get_last_issue_state(self, user_id: int, filter_name: str, issue_key: str) -> Optional[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute(
-            """SELECT issue_data, issue_hash FROM issue_history 
+            """SELECT issue_data, issue_hash FROM issue_history
                WHERE user_id = ? AND filter_name = ? AND issue_key = ?
                ORDER BY created_at DESC LIMIT 1""",
             (user_id, filter_name, issue_key)
@@ -1130,7 +1116,7 @@ class Database:
             issue_hash = row["issue_hash"]
             return {"issue_data": issue_data, "issue_hash": issue_hash}
         return None
-    
+
     async def cleanup_old_issue_history(self, default_days: int = 30) -> int:
         conn = await self._get_conn()
         total_deleted = 0
@@ -1139,33 +1125,33 @@ class Database:
             try:
                 cursor = await conn.execute("SELECT user_id, filter_name, retention_days FROM user_filters")
                 filters = await cursor.fetchall()
-                
+
                 for f in filters:
                     uid = f["user_id"]
                     fname = f["filter_name"]
                     days = f["retention_days"] if f["retention_days"] is not None else default_days
                     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-                    
+
                     cursor = await conn.execute(
                         "DELETE FROM issue_history WHERE user_id = ? AND filter_name = ? AND created_at < ?",
                         (uid, fname, cutoff)
                     )
                     total_deleted += cursor.rowcount
-                    
+
                     cursor = await conn.execute(
                         "DELETE FROM notifications WHERE user_id = ? AND filter_name = ? AND created_at < ?",
                         (uid, fname, cutoff)
                     )
                     total_deleted += cursor.rowcount
-                
+
                 global_cutoff = (datetime.now() - timedelta(days=default_days)).isoformat()
                 cursor = await conn.execute("""
-                    DELETE FROM issue_history 
+                    DELETE FROM issue_history
                     WHERE filter_name NOT IN (SELECT filter_name FROM user_filters WHERE user_id = issue_history.user_id)
                     AND created_at < ?
                 """, (global_cutoff,))
                 total_deleted += cursor.rowcount
-                
+
                 await conn.commit()
                 if total_deleted:
                     logger.info(f"🗑 Cleaned up {total_deleted} old records based on per-filter retention")
@@ -1174,18 +1160,12 @@ class Database:
                 logger.error(f"❌ Error in cleanup_old_issue_history: {e}")
                 raise
         return total_deleted
-    
-    # ------------------- Методы обнаружения изменений -------------------
 
-    # ---------------------------------------------------------------------
-    # Backward compatibility helpers
-    # ---------------------------------------------------------------------
+    # ------------------- Методы обнаружения изменений -------------------
     async def is_user_muted(self, user_id: int) -> bool:
-        """Alias for :meth:`is_notifications_muted` (kept for older code/tests)."""
         return await self.is_notifications_muted(user_id)
 
     async def set_user_muted(self, user_id: int, muted: bool) -> None:
-        """Alias for :meth:`set_notifications_muted` (kept for older code/tests)."""
         await self.set_notifications_muted(user_id, muted)
 
     def _calculate_issue_hash(self, issue_data: Dict[str, Any]) -> str:
@@ -1202,7 +1182,7 @@ class Database:
         }
         issue_str = json.dumps(issue_simplified, sort_keys=True)
         return hashlib.md5(issue_str.encode()).hexdigest()
-    
+
     def _calculate_notification_hash(self, issue: Dict[str, Any], change_type: str) -> str:
         notification_data = {
             "issue_key": issue.get("key"),
@@ -1211,15 +1191,15 @@ class Database:
         }
         data_str = json.dumps(notification_data, sort_keys=True)
         return hashlib.md5(data_str.encode()).hexdigest()
-    
+
     async def check_and_update_issue(self, user_id: int, filter_name: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         issue_key = issue.get("key")
         if not issue_key:
             return {"has_changes": False}
-        
+
         current_hash = self._calculate_issue_hash(issue)
         last_state = await self.get_last_issue_state(user_id, filter_name, issue_key)
-        
+
         if not last_state:
             await self.save_issue_state(user_id, filter_name, issue_key, issue, current_hash)
             return {
@@ -1228,20 +1208,20 @@ class Database:
                 "issue_key": issue_key,
                 "is_new": True
             }
-        else:
-            if last_state["issue_hash"] != current_hash:
-                await self.save_issue_state(user_id, filter_name, issue_key, issue, current_hash)
-                return {
-                    "has_changes": True,
-                    "change_type": "updated",
-                    "issue_key": issue_key,
-                    "is_new": False,
-                    "previous_hash": last_state["issue_hash"],
-                    "current_hash": current_hash
-                }
-            else:
-                return {"has_changes": False}
-    
+
+        if last_state["issue_hash"] != current_hash:
+            await self.save_issue_state(user_id, filter_name, issue_key, issue, current_hash)
+            return {
+                "has_changes": True,
+                "change_type": "updated",
+                "issue_key": issue_key,
+                "is_new": False,
+                "previous_hash": last_state["issue_hash"],
+                "current_hash": current_hash
+            }
+
+        return {"has_changes": False}
+
     async def was_notification_sent(self, user_id: int, filter_name: str, issue_key: str, notification_hash: str) -> bool:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1250,21 +1230,20 @@ class Database:
         )
         count = (await cursor.fetchone())[0]
         return count > 0
-    
+
     # ------------------- Методы уведомлений -------------------
     async def record_notification(self, user_id: int, filter_name: str, issue_key: str,
                                   notification_hash: str, change_type: str,
                                   details: Dict[str, Any] = None) -> int:
-        """Записать уведомление и вернуть его ID."""
         if not details:
             details = {}
         details_json = json.dumps(details)
         message_id = details.get('message_id')
-        
+
         conn = await self._get_conn()
         try:
             cursor = await conn.execute(
-                """INSERT INTO notifications 
+                """INSERT INTO notifications
                    (user_id, filter_name, issue_key, notification_hash, change_type, details, message_id, is_reminder, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 (user_id, filter_name, issue_key, notification_hash, change_type,
@@ -1277,7 +1256,7 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Error recording notification: {e}")
             return None
-    
+
     async def get_notification_by_id(self, notif_id: int) -> Optional[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT * FROM notifications WHERE id = ?", (notif_id,))
@@ -1303,7 +1282,7 @@ class Database:
                 notif["details"] = json.loads(notif["details"])
             notifications.append(notif)
         return notifications
-    
+
     async def get_notifications_with_blockers(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1318,7 +1297,7 @@ class Database:
                 notif["details"] = json.loads(notif["details"])
             notifications.append(notif)
         return notifications
-    
+
     async def get_notifications_by_issue(self, user_id: int, issue_key: str) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1333,12 +1312,10 @@ class Database:
                 notif["details"] = json.loads(notif["details"])
             notifications.append(notif)
         return notifications
-    
+
     # ------------------- Новые методы для дашборда и группировки -------------------
     async def get_dashboard_stats(self, user_id: int) -> Dict[str, int]:
-        """Возвращает статистику для главного экрана: неподтверждённые уведомления, непрочитанные упоминания."""
         conn = await self._get_conn()
-        # Неподтверждённые уведомления (не просроченные)
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND (user_reaction IS NULL OR user_reaction = '') AND is_reminder = 0",
             (user_id,)
@@ -1357,22 +1334,20 @@ class Database:
         }
 
     async def get_pending_notifications_grouped(self, user_id: int) -> List[Dict]:
-        """Возвращает список неподтверждённых уведомлений, сгруппированных по задачам.
-           Каждая запись содержит issue_key, filter_name, count, последнее уведомление, notification_hash для первого?"""
         conn = await self._get_conn()
         cursor = await conn.execute(
             """SELECT issue_key, filter_name, COUNT(*) as cnt, MAX(created_at) as last_time,
-                      (SELECT notification_hash FROM notifications n2 
-                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name 
-                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0 
+                      (SELECT notification_hash FROM notifications n2
+                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name
+                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0
                        ORDER BY created_at DESC LIMIT 1) as last_hash,
-                      (SELECT message_id FROM notifications n2 
-                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name 
-                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0 
+                      (SELECT message_id FROM notifications n2
+                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name
+                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0
                        ORDER BY created_at DESC LIMIT 1) as last_msg_id,
-                      (SELECT id FROM notifications n2 
-                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name 
-                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0 
+                      (SELECT id FROM notifications n2
+                       WHERE n2.user_id = n.user_id AND n2.issue_key = n.issue_key AND n2.filter_name = n.filter_name
+                       AND (n2.user_reaction IS NULL OR n2.user_reaction = '') AND n2.is_reminder = 0
                        ORDER BY created_at DESC LIMIT 1) as last_notif_id
                FROM notifications n
                WHERE user_id = ? AND (user_reaction IS NULL OR user_reaction = '') AND is_reminder = 0
@@ -1403,7 +1378,7 @@ class Database:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-    
+
     async def save_mention(self, user_id: int, issue_key: str, comment_id: str = None,
                            mentioned_by: str = None, mention_text: str = None,
                            mention_type: str = None, mention_hash: str = None) -> bool:
@@ -1413,7 +1388,7 @@ class Database:
         conn = await self._get_conn()
         try:
             await conn.execute(
-                """INSERT OR IGNORE INTO user_mentions 
+                """INSERT OR IGNORE INTO user_mentions
                    (user_id, issue_key, comment_id, mentioned_by, mention_text, mention_type, mention_hash, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_id, issue_key, comment_id, mentioned_by, mention_text, mention_type, mention_hash, now)
@@ -1426,7 +1401,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error saving mention: {e}")
             return False
-    
+
     async def get_unnotified_mentions(self, user_id: int) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1435,7 +1410,7 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
-    
+
     async def mark_mentions_as_notified(self, user_id: int, issue_key: str = None) -> bool:
         conn = await self._get_conn()
         if issue_key:
@@ -1453,27 +1428,27 @@ class Database:
         if updated:
             logger.info(f"✅ Marked {updated} mentions as notified for user {user_id}" + (f" in {issue_key}" if issue_key else ""))
         return True
-    
+
     async def get_total_mentions(self, user_id: int) -> int:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT COUNT(*) FROM user_mentions WHERE user_id = ?", (user_id,))
         count = (await cursor.fetchone())[0]
         return count or 0
-    
+
     # ------------------- Методы для системы напоминаний -------------------
     async def should_send_reminder(self, user_id: int, filter_name: str, issue_key: str) -> Tuple[bool, Optional[int]]:
         try:
             if await self.is_task_muted(user_id, issue_key, filter_name):
                 return False, None
-            
+
             from .utils import should_send_reminder_check
             from .config import REMINDER_INTERVAL_MINUTES
-            
+
             conn = await self._get_conn()
             cursor = await conn.execute(
-                """SELECT id, message_id, created_at FROM notifications 
-                   WHERE user_id = ? AND filter_name = ? AND issue_key = ? 
-                   AND (user_reaction IS NULL OR user_reaction = '') 
+                """SELECT id, message_id, created_at FROM notifications
+                   WHERE user_id = ? AND filter_name = ? AND issue_key = ?
+                   AND (user_reaction IS NULL OR user_reaction = '')
                    AND is_reminder = 0
                    ORDER BY created_at DESC LIMIT 1""",
                 (user_id, filter_name, issue_key)
@@ -1481,23 +1456,22 @@ class Database:
             row = await cursor.fetchone()
             if not row:
                 return False, None
-            
+
             notif_id, message_id, created_at = row
             now = datetime.now()
             notification_time = datetime.fromisoformat(created_at)
             time_diff = now - notification_time
             reminder_interval = timedelta(minutes=REMINDER_INTERVAL_MINUTES)
-            
+
             if time_diff > reminder_interval:
                 if should_send_reminder_check():
                     return True, message_id
-                else:
-                    return False, None
+                return False, None
             return False, None
         except Exception as e:
             logger.error(f"❌ Error in should_send_reminder: {e}")
             return False, None
-    
+
     async def get_pending_notifications(self, user_id: int) -> List[Dict[str, Any]]:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1517,12 +1491,12 @@ class Database:
             'notification_count': row[3],
             'latest_notification': row[4]
         } for row in rows]
-    
+
     async def get_last_notification_info(self, user_id: int, filter_name: str, issue_key: str) -> Optional[Dict]:
         try:
             conn = await self._get_conn()
             cursor = await conn.execute(
-                """SELECT notification_hash, change_type, details FROM notifications 
+                """SELECT notification_hash, change_type, details FROM notifications
                    WHERE user_id = ? AND filter_name = ? AND issue_key = ? AND is_reminder = 0
                    ORDER BY created_at DESC LIMIT 1""",
                 (user_id, filter_name, issue_key)
@@ -1530,10 +1504,10 @@ class Database:
             row = await cursor.fetchone()
             if not row:
                 return None
-            
+
             notification_hash, change_type, details_json = row
             details = json.loads(details_json) if details_json else {}
-            
+
             return {
                 "issue_key": issue_key,
                 "notification_hash": notification_hash,
@@ -1555,7 +1529,7 @@ class Database:
             }
         except Exception:
             return None
-    
+
     async def record_user_reaction(self, user_id: int, issue_key: str, notification_hash: str) -> bool:
         conn = await self._get_conn()
         now = datetime.now().isoformat()
@@ -1564,14 +1538,14 @@ class Database:
             (now, user_id, issue_key, notification_hash)
         )
         await conn.commit()
-        
+
         await conn.execute(
             "UPDATE notifications SET user_reaction = 'acknowledged' WHERE user_id = ? AND issue_key = ? AND (user_reaction IS NULL OR user_reaction = '')",
             (user_id, issue_key)
         )
         await conn.commit()
         return True
-    
+
     async def has_user_reacted(self, user_id: int, issue_key: str, notification_hash: str) -> bool:
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -1580,7 +1554,7 @@ class Database:
         )
         count = (await cursor.fetchone())[0]
         return count > 0
-    
+
     async def is_task_muted(self, user_id: int, issue_key: str, filter_name: str = None) -> bool:
         try:
             conn = await self._get_conn()
@@ -1598,7 +1572,7 @@ class Database:
             return await cursor.fetchone() is not None
         except Exception:
             return False
-    
+
     async def mute_task_notifications(self, user_id: int, issue_key: str, filter_name: str, hours: int = 24) -> bool:
         conn = await self._get_conn()
         await conn.execute(
@@ -1612,7 +1586,7 @@ class Database:
         )
         await conn.commit()
         return True
-    
+
     async def cleanup_expired_muted_tasks(self) -> int:
         now = datetime.now().isoformat()
         cursor = await self._execute_with_retry(
@@ -1622,7 +1596,7 @@ class Database:
         )
         deleted = cursor.rowcount
         return deleted
-    
+
     async def get_changes_from_notification(self, notification_id: int) -> Optional[Dict]:
         conn = await self._get_conn()
         cursor = await conn.execute("SELECT details FROM notifications WHERE id = ?", (notification_id,))
@@ -1630,10 +1604,10 @@ class Database:
         if row and row["details"]:
             try:
                 return json.loads(row["details"]).get("changes", {})
-            except:
+            except Exception:
                 return None
         return None
-    
+
     # ------------------- Статистика -------------------
     async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
         stats = {
@@ -1647,7 +1621,7 @@ class Database:
             'mentions_count': 0
         }
         conn = await self._get_conn()
-        
+
         cursor = await conn.execute(
             "SELECT COUNT(*), SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) FROM user_filters WHERE user_id = ?",
             (user_id,)
@@ -1656,25 +1630,25 @@ class Database:
         if row:
             stats['total_filters'] = row[0] or 0
             stats['active_filters'] = row[1] or 0
-        
+
         cursor = await conn.execute(
             "SELECT COUNT(DISTINCT issue_key) FROM notifications WHERE user_id = ?",
             (user_id,)
         )
         stats['total_tracked'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM notifications WHERE user_id = ?",
             (user_id,)
         )
         stats['total_notifications'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND (user_reaction IS NULL OR user_reaction = '') AND is_reminder = 0",
             (user_id,)
         )
         stats['pending_notifications'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute(
             "SELECT details FROM notifications WHERE user_id = ? AND details LIKE '%blockers%'",
             (user_id,)
@@ -1686,17 +1660,17 @@ class Database:
                     details = json.loads(row[0])
                     stats['blockers_count'] += details.get('blockers_count', 0)
                     stats['active_blockers'] += details.get('active_blockers', 0)
-                except:
+                except Exception:
                     pass
-        
+
         cursor = await conn.execute(
             "SELECT COUNT(*) FROM user_mentions WHERE user_id = ?",
             (user_id,)
         )
         stats['mentions_count'] = (await cursor.fetchone())[0] or 0
-        
+
         return stats
-    
+
     async def get_system_stats(self) -> Dict[str, Any]:
         stats = {
             'total_users': 0,
@@ -1709,24 +1683,30 @@ class Database:
             'total_mentions': 0
         }
         conn = await self._get_conn()
-        
+
         cursor = await conn.execute("SELECT COUNT(*) FROM users")
         stats['total_users'] = (await cursor.fetchone())[0] or 0
-        
-        cursor = await conn.execute(
-            "SELECT COUNT(*) FROM users WHERE is_active = 1 AND jira_user IS NOT NULL AND jira_token IS NOT NULL"
-        )
+
+        auth_mode = (os.getenv("JIRA_AUTH_MODE", "auto") or "auto").strip().lower()
+        if auth_mode == "bearer":
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM users WHERE is_active = 1 AND jira_token IS NOT NULL"
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM users WHERE is_active = 1 AND jira_user IS NOT NULL AND jira_token IS NOT NULL"
+            )
         stats['active_users'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute("SELECT COUNT(*) FROM user_filters")
         stats['total_filters'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute("SELECT COUNT(*) FROM user_filters WHERE is_active = 1")
         stats['active_filters'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute("SELECT COUNT(*) FROM notifications")
         stats['total_notifications'] = (await cursor.fetchone())[0] or 0
-        
+
         cursor = await conn.execute("SELECT details FROM notifications WHERE details LIKE '%blockers%'")
         rows = await cursor.fetchall()
         for row in rows:
@@ -1735,18 +1715,16 @@ class Database:
                     details = json.loads(row[0])
                     stats['blockers_count'] += details.get('blockers_count', 0)
                     stats['active_blockers'] += details.get('active_blockers', 0)
-                except:
+                except Exception:
                     pass
-        
+
         cursor = await conn.execute("SELECT COUNT(*) FROM user_mentions")
         stats['total_mentions'] = (await cursor.fetchone())[0] or 0
-        
+
         return stats
-    
+
     # ------------------- Очистка данных -------------------
     async def cleanup_null_issue_data(self) -> int:
-        # В некоторых окружениях (Docker + volume) на старте иногда ловится disk I/O.
-        # Делаем retry + сброс соединения.
         async with self._lock:
             cursor = await self._execute_with_retry(
                 "DELETE FROM issue_history WHERE issue_data IS NULL",
@@ -1760,7 +1738,6 @@ class Database:
 
     async def cleanup_old_data(self, days: int = 30) -> int:
         total_deleted = 0
-        # Cleanup — это maintenance, он не должен валить весь бот при временных I/O/lock.
         try:
             total_deleted += await self.cleanup_null_issue_data()
             total_deleted += await self.cleanup_expired_sessions()
@@ -1769,7 +1746,7 @@ class Database:
         except Exception as e:
             logger.warning(f"⚠️ Cleanup failed (continuing): {e}")
             return total_deleted
-        
+
         mention_cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         try:
             cursor = await self._execute_with_retry(
@@ -1780,10 +1757,9 @@ class Database:
             total_deleted += cursor.rowcount
         except Exception as e:
             logger.warning(f"⚠️ Cleanup user_mentions failed (continuing): {e}")
-        
+
         logger.info(f"✅ Total cleaned up {total_deleted} old records")
         return total_deleted
-    
 
     # ------------------- Fun / Personality / Gamification -------------------
     async def get_fun_settings(self, user_id: int) -> Dict[str, Any]:
@@ -1852,7 +1828,6 @@ class Database:
         await conn.commit()
 
     def _level_from_xp(self, xp: int) -> int:
-        # Простая прогрессия: lvl 1 = 0..99, lvl 2 = 100..249, lvl 3 = 250..449 ...
         if xp is None:
             xp = 0
         lvl = 1
@@ -1860,7 +1835,7 @@ class Database:
         step = 100
         while xp >= threshold + step:
             threshold += step
-            step += 50  # чуть сложнее с каждым уровнем
+            step += 50
             lvl += 1
             if lvl > 50:
                 break
@@ -1886,7 +1861,6 @@ class Database:
         return {"xp": new_xp, "level": new_level}
 
     async def apply_ack_gamification(self, user_id: int) -> Dict[str, Any]:
-        """Начисляет XP и поддерживает ежедневный стрик по факту подтверждения уведомления."""
         conn = await self._get_conn()
         cursor = await conn.execute(
             "SELECT xp, level, streak, last_ack_date FROM users WHERE user_id = ?",
@@ -1909,11 +1883,10 @@ class Database:
             last_date = None
 
         if last_date == today:
-            # уже подтверждал сегодня: небольшой бонус
             gain = 3
         elif last_date == (today - timedelta(days=1)):
             streak += 1
-            gain = 12 + min(8, streak)  # чем больше стрик, тем приятнее
+            gain = 12 + min(8, streak)
         else:
             streak = 1
             gain = 10
@@ -1930,15 +1903,17 @@ class Database:
 
         return {"xp_gain": gain, "xp": xp, "level": level, "streak": streak}
 
-
     # ------------------- Backup -------------------
     async def backup_database(self, backup_path: str = None) -> str:
         import shutil
         if backup_path is None:
             backup_dir = os.path.join(os.path.dirname(self.db_path), "backups")
             os.makedirs(backup_dir, exist_ok=True)
-            backup_path = os.path.join(backup_dir, f"jira_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-        
+            backup_path = os.path.join(
+                backup_dir,
+                f"jira_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            )
+
         await self.close()
         shutil.copy2(self.db_path, backup_path)
         key_path = os.path.join(os.path.dirname(self.db_path), "encryption.key")
@@ -1946,6 +1921,7 @@ class Database:
             shutil.copy2(key_path, backup_path.replace(".db", ".key"))
         await self._get_conn()
         return backup_path
+
 
 from .config import ENCRYPTION_KEY, DATABASE_PATH
 

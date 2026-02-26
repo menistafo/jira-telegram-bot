@@ -167,7 +167,7 @@ async def check_user_filters(application: Application, user_id: int) -> int:
                 except JiraAuthError:
                     logger.error("❌ Jira auth error for user %s", user_id)
                     await handle_jira_auth_error(application, user_id)
-                    break
+                    return total_notified  # ← ВАЖНО: прекращаем использовать закрытый client
                 except Exception as e:
                     logger.error("Error searching issues for filter %s: %s", filter_name, e)
                     break
