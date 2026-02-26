@@ -54,6 +54,13 @@ class JiraClient:
     async def close(self):
         await self.client.aclose()
         logger.debug(f"Async JiraClient closed for {self.username}")
+
+    async def aclose(self):
+        """
+        Алиас для совместимости.
+        JiraManager вызывает aclose(), поэтому просто проксируем в close().
+        """
+        await self.close()
     
     async def _make_request(
         self,
