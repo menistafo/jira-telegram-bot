@@ -93,6 +93,7 @@ async def _maybe_add_fun_snippet(
         return base_text.rstrip() + "\n" + "\n".join(extra_lines) + "\n"
     return base_text
 
+
 async def check_all_task_mutes(user_id: int, issue_key: str) -> bool:
     all_notifications = await db.get_notifications_by_issue(user_id, issue_key)
     for notif in all_notifications:
@@ -135,7 +136,8 @@ async def handle_jira_auth_error(application: Application, user_id: int, context
                 f"🚨 У пользователя {user_id} возникла ошибка авторизации в Jira (401)."
             )
     # Удаляем клиент (он всё равно нерабочий)
-    await jira_manager.remove_client(user_id)
+    # ✅ FIX: в JiraManager нет remove_client, есть invalidate_client :contentReference[oaicite:1]{index=1}
+    await jira_manager.invalidate_client(user_id)
 
 
 async def send_notification_with_changes(application: Application, user_id: int, filter_name: str,
@@ -186,7 +188,6 @@ async def send_notification_with_changes(application: Application, user_id: int,
     fun_settings = await _get_fun_settings(user_id)
     if _is_fun_enabled(fun_settings) and fun_settings.get("whisper_enabled", 1) and not should_send_reminder_check():
         title = f"🌙 Шёпотом: {title}"
-
 
     changes_text = ""
     if changes:
@@ -432,5 +433,3 @@ async def send_mention_notification(application: Application, user_id: int, ment
         logger.error(traceback.format_exc())
 
     return None
-
-
